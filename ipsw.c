@@ -356,36 +356,7 @@ ipsw_archive_t ipsw_open(const char* ipsw)
     return ipsw_open_with_callback(ipsw, NULL, NULL);
 }
 
-/*
-ipsw_archive_t ipsw_open(const char* ipsw)
-{
-	int err = 0;
-	ipsw_archive_t archive = (ipsw_archive_t)calloc(1, sizeof(struct ipsw_archive));
-	if (archive == NULL) {
-		error("ERROR: Out of memory\n");
-		return NULL;
-	}
 
-	struct stat fst;
-	if (stat(ipsw, &fst) != 0) {
-		error("ERROR: ipsw_open %s: %s\n", ipsw, strerror(errno));
-		return NULL;
-	}
-	if (S_ISDIR(fst.st_mode)) {
-		archive->zip = 0;
-	} else {
-		struct zip *zip = zip_open(ipsw, 0, &err);
-		if (zip == NULL) {
-			error("ERROR: zip_open: %s: %d\n", ipsw, err);
-			free(archive);
-			return NULL;
-		}
-		archive->zip = 1;
-	}
-	archive->path = strdup(ipsw);
-	return (ipsw_archive_t)archive;
-}
-*/
 void ipsw_close(ipsw_archive_t ipsw)
 {
 	if (ipsw != NULL) {
@@ -403,57 +374,7 @@ int ipsw_is_directory(const char* ipsw)
 	}
 	return S_ISDIR(fst.st_mode);
 }
-/*
-int ipsw_get_file_size(ipsw_archive_t ipsw, const char* infile, uint64_t* size)
-{
-	if (ipsw == NULL) {
-		error("ERROR: Invalid archive\n");
-		return -1;
-	}
 
-	if (ipsw->zip) {
-		int err = 0;
-		struct zip *zip = zip_open(ipsw->path, 0, &err);
-		if (zip == NULL) {
-			error("ERROR: zip_open: %s: %d\n", ipsw->path, err);
-			return -1;
-		}
-		int zindex = zip_name_locate(zip, infile, 0);
-		if (zindex < 0) {
-			error("ERROR: zip_name_locate: %s\n", infile);
-			zip_unchange_all(zip);
-			zip_close(zip);
-			return -1;
-		}
-
-		struct zip_stat zstat;
-		zip_stat_init(&zstat);
-		if (zip_stat_index(zip, zindex, 0, &zstat) != 0) {
-			error("ERROR: zip_stat_index: %s\n", infile);
-			zip_unchange_all(zip);
-			zip_close(zip);
-			return -1;
-		}
-		zip_unchange_all(zip);
-		zip_close(zip);
-
-		*size = zstat.size;
-	} else {
-		char *filepath = build_path(ipsw->path, infile);
-		struct stat fst;
-		if (stat(filepath, &fst) != 0) {
-			free(filepath);
-			return -1;
-		}
-		free(filepath);
-
-		*size = fst.st_size;
-	}
-
-	return 0;
-}*/
-
-// 文件大小获取实现
 int ipsw_get_file_size(ipsw_archive_t ipsw, const char* infile, uint64_t* size)
 {
     if (!ipsw || !infile || !size) {
@@ -504,195 +425,7 @@ int ipsw_get_file_size(ipsw_archive_t ipsw, const char* infile, uint64_t* size)
     }
 }
 
-/*
-int ipsw_extract_to_file_with_progress(ipsw_archive_t ipsw, const char* infile, const char* outfile, int print_progress)
-{
-	int ret = 0;
 
-	if (!ipsw || !infile || !outfile) {
-		error("ERROR: Invalid argument\n");
-		return -1;
-	}
-
-	cancel_flag = 0;
-
-	if (ipsw->zip) {
-		int err = 0;
-		struct zip *zip = zip_open(ipsw->path, 0, &err);
-		if (zip == NULL) {
-			error("ERROR: zip_open: %s: %d\n", ipsw->path, err);
-			return -1;
-		}
-
-		int zindex = zip_name_locate(zip, infile, 0);
-		if (zindex < 0) {
-			zip_unchange_all(zip);
-			zip_close(zip);
-			error("ERROR: zip_name_locate: %s\n", infile);
-			return -1;
-		}
-
-		struct zip_stat zstat;
-		zip_stat_init(&zstat);
-		if (zip_stat_index(zip, zindex, 0, &zstat) != 0) {
-			zip_unchange_all(zip);
-			zip_close(zip);
-			error("ERROR: zip_stat_index: %s\n", infile);
-			return -1;
-		}
-
-		char* buffer = (char*) malloc(BUFSIZE);
-		if (buffer == NULL) {
-			zip_unchange_all(zip);
-			zip_close(zip);
-			error("ERROR: Unable to allocate memory\n");
-			return -1;
-		}
-
-		struct zip_file* zfile = zip_fopen_index(zip, zindex, 0);
-		if (zfile == NULL) {
-			zip_unchange_all(zip);
-			zip_close(zip);
-			error("ERROR: zip_fopen_index: %s\n", infile);
-			return -1;
-		}
-
-		FILE* fd = fopen(outfile, "wb");
-		if (fd == NULL) {
-			zip_fclose(zfile);
-			zip_unchange_all(zip);
-			zip_close(zip);
-			error("ERROR: Unable to open output file: %s\n", outfile);
-			return -1;
-		}
-
-		uint64_t i, bytes = 0;
-		int count, size = BUFSIZE;
-		double progress;
-		for(i = zstat.size; i > 0; i -= count) {
-			if (cancel_flag) {
-				break;
-			}
-			if (i < BUFSIZE)
-				size = i;
-			count = zip_fread(zfile, buffer, size);
-			if (count < 0) {
-				int zep = 0;
-				int sep = 0;
-				zip_file_error_get(zfile, &zep, &sep);
-				error("ERROR: zip_fread: %s %d %d\n", infile, zep, sep);
-				ret = -1;
-				break;
-			}
-			if (fwrite(buffer, 1, count, fd) != count) {
-				error("ERROR: Writing to '%s' failed: %s\n", outfile, strerror(errno));
-				ret = -1;
-				break;
-			}
-
-			bytes += size;
-			if (print_progress) {
-				progress = ((double)bytes / (double)zstat.size) * 100.0;
-				print_progress_bar(progress);
-			}
-		}
-		free(buffer);
-		fclose(fd);
-		zip_fclose(zfile);
-		zip_unchange_all(zip);
-		zip_close(zip);
-	} else {
-		char *filepath = build_path(ipsw->path, infile);
-		char actual_filepath[PATH_MAX+1];
-		char actual_outfile[PATH_MAX+1];
-		if (!filepath) {
-			ret = -1;
-			goto leave;
-		}
-		if (!realpath(filepath, actual_filepath)) {
-			error("ERROR: realpath failed on %s: %s\n", filepath, strerror(errno));
-			ret = -1;
-			goto leave;
-		} else {
-			actual_outfile[0] = '\0';
-			if (realpath(outfile, actual_outfile) && (strcmp(actual_filepath, actual_outfile) == 0)) {
-				// files are identical 
-				ret = 0;
-			} else {
-				if (actual_outfile[0] == '\0') {
-					strcpy(actual_outfile, outfile);
-				}
-				FILE *fi = fopen(actual_filepath, "rb");
-				if (!fi) {
-					error("ERROR: fopen: %s: %s\n", actual_filepath, strerror(errno));
-					ret = -1;
-					goto leave;
-				}
-				struct stat fst;
-				if (fstat(fileno(fi), &fst) != 0) {
-					fclose(fi);
-					error("ERROR: fstat: %s: %s\n", actual_filepath, strerror(errno));
-					ret = -1;
-					goto leave;
-				}
-				FILE *fo = fopen(actual_outfile, "wb");
-				if (!fo) {
-					fclose(fi);
-					error("ERROR: fopen: %s: %s\n", actual_outfile, strerror(errno));
-					ret = -1;
-					goto leave;
-				}
-				char* buffer = (char*) malloc(BUFSIZE);
-				if (buffer == NULL) {
-					fclose(fi);
-					fclose(fo);
-					error("ERROR: Unable to allocate memory\n");
-					ret = -1;
-					goto leave;;
-				}
-
-				uint64_t bytes = 0;
-				double progress;
-				while (!feof(fi)) {
-					if (cancel_flag) {
-						break;
-					}
-					ssize_t r = fread(buffer, 1, BUFSIZE, fi);
-					if (r < 0) {
-						error("ERROR: fread failed: %s\n", strerror(errno));
-						ret = -1;
-						break;
-					}
-					if (fwrite(buffer, 1, r, fo) != r) {
-						error("ERROR: Writing to '%s' failed: %s\n", actual_outfile, strerror(errno));
-						ret = -1;
-						break;
-					}
-					bytes += r;
-					if (print_progress) {
-						progress = ((double)bytes / (double)fst.st_size) * 100.0;
-						print_progress_bar(progress);
-					}
-				}
-
-				free(buffer);
-				fclose(fi);
-				fclose(fo);
-			}
-		}
-	leave:
-		free(filepath);
-	}
-	if (cancel_flag) {
-		ret = -2;
-	}
-	return ret;
-}
-
-*/
-
-// 提取到文件的实现
-// 提取到文件的实现 - 修改后的版本
 int ipsw_extract_to_file_with_progress(ipsw_archive_t ipsw, const char* infile, const char* outfile, int print_progress)
 {
     if (!ipsw || !infile || !outfile) {
@@ -878,47 +611,12 @@ int ipsw_extract_to_file_with_progress(ipsw_archive_t ipsw, const char* infile, 
     }
 }
 
-
-
-// 无进度条提取实现
 int ipsw_extract_to_file(ipsw_archive_t ipsw, const char* infile, const char* outfile)
 {
 	return ipsw_extract_to_file_with_progress(ipsw, infile, outfile, 0);
 }
 
-/*
-int ipsw_file_exists(ipsw_archive_t ipsw, const char* infile)
-{
-	if (!ipsw) {
-		return 0;
-	}
 
-	if (ipsw->zip) {
-		int err = 0;
-		struct zip *zip = zip_open(ipsw->path, 0, &err);
-		if (zip == NULL) {
-			error("ERROR: zip_open: %s: %d\n", ipsw->path, err);
-			return 0;
-		}
-		int zindex = zip_name_locate(zip, infile, 0);
-		zip_unchange_all(zip);
-		zip_close(zip);
-		if (zindex < 0) {
-			return 0;
-		}
-	} else {
-		char *filepath = build_path(ipsw->path, infile);
-		if (access(filepath, R_OK) != 0) {
-			free(filepath);
-			return 0;
-		}
-		free(filepath);
-	}
-
-	return 1;
-}*/
-
-// 文件是否存在检查实现
 int ipsw_file_exists(ipsw_archive_t ipsw, const char* infile)
 {
     if (!ipsw || !infile) {
@@ -949,139 +647,7 @@ int ipsw_file_exists(ipsw_archive_t ipsw, const char* infile)
     }
 }
 
-/*
-int ipsw_extract_to_memory(ipsw_archive_t ipsw, const char* infile, unsigned char** pbuffer, unsigned int* psize)
-{
-	size_t size = 0;
-	unsigned char* buffer = NULL;
-	if (ipsw == NULL) {
-		error("ERROR: Invalid archive\n");
-		return -1;
-	}
 
-	if (ipsw->zip) {
-		int err = 0;
-		struct zip *zip = zip_open(ipsw->path, 0, &err);
-		if (zip == NULL) {
-			error("ERROR: zip_open: %s: %d\n", ipsw->path, err);
-			return -1;
-		}
-
-		int zindex = zip_name_locate(zip, infile, 0);
-		if (zindex < 0) {
-			zip_unchange_all(zip);
-			zip_close(zip);
-			debug("NOTE: zip_name_locate: '%s' not found in archive.\n", infile);
-			return -1;
-		}
-
-		struct zip_stat zstat;
-		zip_stat_init(&zstat);
-		if (zip_stat_index(zip, zindex, 0, &zstat) != 0) {
-			zip_unchange_all(zip);
-			zip_close(zip);
-			error("ERROR: zip_stat_index: %s\n", infile);
-			return -1;
-		}
-
-		struct zip_file* zfile = zip_fopen_index(zip, zindex, 0);
-		if (zfile == NULL) {
-			zip_unchange_all(zip);
-			zip_close(zip);
-			error("ERROR: zip_fopen_index: %s\n", infile);
-			return -1;
-		}
-
-		size = zstat.size;
-		buffer = (unsigned char*) malloc(size+1);
-		if (buffer == NULL) {
-			error("ERROR: Out of memory\n");
-			zip_fclose(zfile);
-			zip_unchange_all(zip);
-			zip_close(zip);
-			return -1;
-		}
-
-		zip_int64_t zr = zip_fread(zfile, buffer, size);
-		zip_fclose(zfile);
-		zip_unchange_all(zip);
-		zip_close(zip);
-		if (zr < 0) {
-			int zep = 0;
-			int sep = 0;
-			zip_file_error_get(zfile, &zep, &sep);
-			error("ERROR: zip_fread: %s %d %d\n", infile, zep, sep);
-			free(buffer);
-			return -1;
-		} else if (zr != size) {
-			error("ERROR: zip_fread: %s got only %lld of %zu\n", infile, zr, size);
-			free(buffer);
-			return -1;
-		}
-
-		buffer[size] = '\0';
-	} else {
-		char *filepath = build_path(ipsw->path, infile);
-		struct stat fst;
-#ifdef WIN32
-		if (stat(filepath, &fst) != 0) {
-#else
-		if (lstat(filepath, &fst) != 0) {
-#endif
-			error("ERROR: %s: stat failed for %s: %s\n", __func__, filepath, strerror(errno));
-			free(filepath);
-			return -1;
-		}
-		size = fst.st_size;
-		buffer = (unsigned char*)malloc(size+1);
-		if (buffer == NULL) {
-			error("ERROR: Out of memory\n");
-			free(filepath);
-			return -1;
-		}
-
-#ifndef WIN32
-		if (S_ISLNK(fst.st_mode)) {
-			if (readlink(filepath, (char*)buffer, size) < 0) {
-				error("ERROR: %s: readlink failed for %s: %s\n", __func__, filepath, strerror(errno));
-				free(filepath);
-				free(buffer);
-				return -1;
-			}
-		} else {
-#endif
-			FILE *f = fopen(filepath, "rb");
-			if (!f) {
-				error("ERROR: %s: fopen failed for %s: %s\n", __func__, filepath, strerror(errno));
-				free(filepath);
-				free(buffer);
-				return -2;
-			}
-			if (fread(buffer, 1, size, f) != size) {
-				fclose(f);
-				error("ERROR: %s: fread failed for %s: %s\n", __func__, filepath, strerror(errno));
-				free(filepath);
-				free(buffer);
-				return -1;
-			}
-			fclose(f);
-#ifndef WIN32
-		}
-#endif
-		buffer[size] = '\0';
-
-		free(filepath);
-	}
-
-	*pbuffer = buffer;
-	*psize = size;
-	return 0;
-}
-
-*/
-
-
-/* 提取 IPSW 文件到内存，支持 ZIP 解密 */
 int ipsw_extract_to_memory(ipsw_archive_t ipsw, const char* infile, unsigned char** pbuffer, unsigned int* psize)
 {
     size_t size = 0;
@@ -1220,157 +786,6 @@ int ipsw_extract_to_memory(ipsw_archive_t ipsw, const char* infile, unsigned cha
 }
 
 
-/*
-int ipsw_extract_send(ipsw_archive_t ipsw, const char* infile, int blocksize, ipsw_send_cb send_callback, void* ctx)
-{
-	unsigned char* buffer = NULL;
-	size_t done = 0;
-	size_t total_size = 0;
-
-	if (ipsw == NULL) {
-		error("ERROR: Invalid archive\n");
-		return -1;
-	}
-
-	if (ipsw->zip) {
-		int err = 0;
-		struct zip *zip = zip_open(ipsw->path, 0, &err);
-		if (zip == NULL) {
-			error("ERROR: zip_open: %s: %d\n", ipsw->path, err);
-			return -1;
-		}
-
-		int zindex = zip_name_locate(zip, infile, 0);
-		if (zindex < 0) {
-			zip_unchange_all(zip);
-			zip_close(zip);
-			debug("NOTE: zip_name_locate: '%s' not found in archive.\n", infile);
-			return -1;
-		}
-
-		struct zip_stat zstat;
-		zip_stat_init(&zstat);
-		if (zip_stat_index(zip, zindex, 0, &zstat) != 0) {
-			zip_unchange_all(zip);
-			zip_close(zip);
-			error("ERROR: zip_stat_index: %s\n", infile);
-			return -1;
-		}
-
-		struct zip_file* zfile = zip_fopen_index(zip, zindex, 0);
-		if (zfile == NULL) {
-			zip_unchange_all(zip);
-			zip_close(zip);
-			error("ERROR: zip_fopen_index: %s\n", infile);
-			return -1;
-		}
-
-		total_size = zstat.size;
-		buffer = (unsigned char*) malloc(blocksize);
-		if (buffer == NULL) {
-			zip_fclose(zfile);
-			zip_unchange_all(zip);
-			zip_close(zip);
-			error("ERROR: Out of memory\n");
-			return -1;
-		}
-
-		while (done < total_size) {
-			size_t size = total_size-done;
-			if (size > blocksize) size = blocksize;
-			zip_int64_t zr = zip_fread(zfile, buffer, size);
-			if (zr < 0) {
-				error("ERROR: %s: zip_fread: %s\n", __func__, infile);
-				break;
-			} else if (zr == 0) {
-				// EOF
-				break;
-			}
-			if (send_callback(ctx, buffer, zr, done, total_size) < 0) {
-				error("ERROR: %s: send failed\n", __func__);
-				break;
-			}
-			done += zr;
-		}
-		free(buffer);
-		zip_fclose(zfile);
-		zip_unchange_all(zip);
-		zip_close(zip);
-	} else {
-		char *filepath = build_path(ipsw->path, infile);
-		struct stat fst;
-#ifdef WIN32
-		if (stat(filepath, &fst) != 0) {
-#else
-		if (lstat(filepath, &fst) != 0) {
-#endif
-			error("ERROR: %s: stat failed for %s: %s\n", __func__, filepath, strerror(errno));
-			free(filepath);
-			return -1;
-		}
-		total_size = fst.st_size;
-		buffer = (unsigned char*)malloc(blocksize);
-		if (buffer == NULL) {
-			error("ERROR: Out of memory\n");
-			free(filepath);
-			return -1;
-		}
-
-#ifndef WIN32
-		if (S_ISLNK(fst.st_mode)) {
-			ssize_t rl = readlink(filepath, (char*)buffer, (total_size > blocksize) ? blocksize : total_size);
-			if (rl < 0) {
-				error("ERROR: %s: readlink failed for %s: %s\n", __func__, filepath, strerror(errno));
-				free(filepath);
-				free(buffer);
-				return -1;
-			}
-			send_callback(ctx, buffer, (size_t)rl, 0, 0);
-		} else {
-#endif
-			FILE *f = fopen(filepath, "rb");
-			if (!f) {
-				error("ERROR: %s: fopen failed for %s: %s\n", __func__, filepath, strerror(errno));
-				free(filepath);
-				free(buffer);
-				return -2;
-			}
-
-			while (done < total_size) {
-				size_t size = total_size-done;
-				if (size > blocksize) size = blocksize;
-				size_t fr = fread(buffer, 1, size, f);
-				if (fr != size) {
-					error("ERROR: %s: fread failed for %s: %s\n", __func__, filepath, strerror(errno));
-					break;
-				}
-				if (send_callback(ctx, buffer, fr, done, total_size) < 0) {
-					error("ERROR: %s: send failed\n", __func__);
-					break;
-				}
-				done += fr;
-			}
-			fclose(f);
-#ifndef WIN32
-		}
-#endif
-		free(filepath);
-		free(buffer);
-	}
-
-	if (done < total_size) {
-		error("ERROR: %s: Sending file data for %s failed (sent %" PRIu64 "/%" PRIu64 ")\n", __func__, infile, (uint64_t)done, (uint64_t)total_size);
-		return -1;
-	}
-
-	// send a NULL buffer to mark end of transfer
-	send_callback(ctx, NULL, 0, done, total_size);
-
-	return 0;
-}
-*/
-
-// 发送文件实现
 int ipsw_extract_send(ipsw_archive_t ipsw, const char* infile, int blocksize, ipsw_send_cb send_callback, void* ctx)
 {
     if (!ipsw || !infile || !send_callback) {
@@ -1576,37 +991,6 @@ int ipsw_extract_send(ipsw_archive_t ipsw, const char* infile, int blocksize, ip
 }
 
 
-/*
-int ipsw_extract_build_manifest(ipsw_archive_t ipsw, plist_t* buildmanifest, int *tss_enabled)
-{
-	unsigned int size = 0;
-	unsigned char* data = NULL;
-
-	*tss_enabled = 0;
-
-	// older devices don't require personalized firmwares and use a BuildManifesto.plist 
-	if (ipsw_file_exists(ipsw, "BuildManifesto.plist")) {
-		if (ipsw_extract_to_memory(ipsw, "BuildManifesto.plist", &data, &size) == 0) {
-			plist_from_xml((char*)data, size, buildmanifest);
-			free(data);
-			return 0;
-		}
-	}
-
-	data = NULL;
-	size = 0;
-
-	// whereas newer devices do not require personalized firmwares and use a BuildManifest.plist 
-	if (ipsw_extract_to_memory(ipsw, "BuildManifest.plist", &data, &size) == 0) {
-		*tss_enabled = 1;
-		plist_from_xml((char*)data, size, buildmanifest);
-		free(data);
-		return 0;
-	}
-
-	return -1;
-}*/
-
 // BuildManifest 提取实现
 int ipsw_extract_build_manifest(ipsw_archive_t ipsw, plist_t* buildmanifest, int *tss_enabled)
 {
@@ -1675,20 +1059,6 @@ int ipsw_extract_build_manifest(ipsw_archive_t ipsw, plist_t* buildmanifest, int
     return ret;
 }
 
-/*
-int ipsw_extract_restore_plist(ipsw_archive_t ipsw, plist_t* restore_plist)
-{
-	unsigned int size = 0;
-	unsigned char* data = NULL;
-
-	if (ipsw_extract_to_memory(ipsw, "Restore.plist", &data, &size) == 0) {
-		plist_from_xml((char*)data, size, restore_plist);
-		free(data);
-		return 0;
-	}
-
-	return -1;
-}*/
 
 // Restore.plist 提取实现
 int ipsw_extract_restore_plist(ipsw_archive_t ipsw, plist_t* restore_plist)
@@ -2029,23 +1399,7 @@ int ipsw_get_latest_fw(plist_t version_data, const char* product, char** fwurl, 
 
 	return 0;
 }
-/*
-static int sha1_verify_fp(FILE* f, unsigned char* expected_sha1)
-{
-	unsigned char tsha1[20];
-	char buf[8192];
-	if (!f) return 0;
-	sha1_context sha1ctx;
-	sha1_init(&sha1ctx);
-	rewind(f);
-	while (!feof(f)) {
-		size_t sz = fread(buf, 1, 8192, f);
-		sha1_update(&sha1ctx, buf, sz);
-	}
-	sha1_final(&sha1ctx, tsha1);
-	return (memcmp(expected_sha1, tsha1, 20) == 0) ? 1 : 0;
-}
-*/
+
 // SHA1 验证辅助函数
 static int sha1_verify_fp(FILE* f, unsigned char* expected_sha1)
 {
@@ -2186,57 +1540,6 @@ void ipsw_cancel(void)
 	cancel_flag++;
 }
 
-/*
-ipsw_file_handle_t ipsw_file_open(ipsw_archive_t ipsw, const char* path)
-{
-	ipsw_file_handle_t handle = (ipsw_file_handle_t)calloc(1, sizeof(struct ipsw_file_handle));
-	if (ipsw->zip) {
-		int err = 0;
-		struct zip *zip = zip_open(ipsw->path, 0, &err);
-		if (zip == NULL) {
-			error("ERROR: zip_open: %s: %d\n", ipsw->path, err);
-			return NULL;
-		}
-
-		zip_stat_t zst;
-		zip_int64_t zindex = zip_name_locate(zip, path, 0);
-		if (zindex < 0) {
-			error("ERROR: zip_name_locate: %s not found\n", path);
-			zip_unchange_all(zip);
-			zip_close(zip);
-			free(handle);
-			return NULL;
-		}
-		handle->zfile = zip_fopen_index(zip, zindex, 0);
-		if (handle->zfile == NULL) {
-			error("ERROR: zip_fopen_index: %s could not be opened\n", path);
-			zip_unchange_all(zip);
-			zip_close(zip);
-			free(handle);
-			return NULL;
-		}
-		zip_stat_init(&zst);
-		zip_stat(zip, path, 0, &zst);
-		handle->size = zst.size;
-		handle->seekable = (zst.comp_method == ZIP_CM_STORE);
-		handle->zip = zip;
-	} else {
-		struct stat st;
-		char *filepath = build_path(ipsw->path, path);
-		handle->file = fopen(filepath, "rb");
-		free(filepath);
-		if (!handle->file) {
-			error("ERROR: fopen: %s could not be opened\n", path);
-			free(handle);
-			return NULL;
-		}
-		fstat(fileno(handle->file), &st);
-		handle->size = st.st_size;
-		handle->seekable = 1;
-	}
-	return handle;
-}*/
-
 // 文件句柄操作实现
 ipsw_file_handle_t ipsw_file_open(ipsw_archive_t ipsw, const char* path)
 {
@@ -2315,18 +1618,6 @@ ipsw_file_handle_t ipsw_file_open(ipsw_archive_t ipsw, const char* path)
     return handle;
 }
 
-/*
-void ipsw_file_close(ipsw_file_handle_t handle)
-{
-	if (handle && handle->zfile) {
-		zip_fclose(handle->zfile);
-		zip_unchange_all(handle->zip);
-		zip_close(handle->zip);
-	} else if (handle && handle->file) {
-		fclose(handle->file);
-	}
-	free(handle);
-}*/
 
 void ipsw_file_close(ipsw_file_handle_t handle)
 {
@@ -2346,15 +1637,6 @@ void ipsw_file_close(ipsw_file_handle_t handle)
     }
     free(handle);
 }
-
-/*
-uint64_t ipsw_file_size(ipsw_file_handle_t handle)
-{
-	if (handle) {
-		return handle->size;
-	}
-	return 0;
-}*/
 
 
 uint64_t ipsw_file_size(ipsw_file_handle_t handle)
