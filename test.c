@@ -47,7 +47,7 @@
 #include <openssl/evp.h>
 
 #define BUFSIZE 0x100000
-#define TO_FILE_BLOCK_SIZE 4096 // 设定块大小
+#define TO_FILE_BLOCK_SIZE 32768 // 设定块大小
 #define AES_BLOCK_SIZE 16 
 
 static int cancel_flag = 0;
@@ -1788,11 +1788,33 @@ int64_t ipsw_file_read(ipsw_file_handle_t handle, void* buffer, size_t size) {
         return -1;
     }
 
+    // 检查是否超出文件大小
+    uint64_t current_pos = 0;
+    if (handle->zfile) {
+        current_pos = zip_ftell(handle->zfile);
+    } else if (handle->file) {
+        current_pos = ftello(handle->file);
+    }
+    
+    if (current_pos + size > handle->size) {
+        size = handle->size - current_pos;
+        if (size == 0) {
+            return 0; // EOF
+        }
+    }
+
     if (handle->is_encrypted) {
-        // 计算需要读取的对齐块大小
+        // 对齐到 AES 块大小
         size_t aligned_size = ((size + handle->_seek_block_index + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
+        
+        // 确保不会读取超过文件末尾
+        if (current_pos + aligned_size > handle->size) {
+            aligned_size = ((handle->size - current_pos + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
+        }
+        
         unsigned char* temp_buffer = malloc(aligned_size);
         if (!temp_buffer) {
+            fprintf(stderr, "ERROR: Out of memory\n");
             return -1;
         }
 
@@ -1804,8 +1826,9 @@ int64_t ipsw_file_read(ipsw_file_handle_t handle, void* buffer, size_t size) {
             read_size = fread(temp_buffer, 1, aligned_size, handle->file);
         }
 
-        if (read_size < 0) {
+        if (read_size <= 0) {
             free(temp_buffer);
+            fprintf(stderr, "ERROR: Read failed at offset 0x%" PRIx64 "\n", current_pos);
             return -1;
         }
 
@@ -1813,26 +1836,41 @@ int64_t ipsw_file_read(ipsw_file_handle_t handle, void* buffer, size_t size) {
         unsigned char* decrypted = malloc(aligned_size + AES_BLOCK_SIZE);
         if (!decrypted) {
             free(temp_buffer);
+            fprintf(stderr, "ERROR: Out of memory\n");
             return -1;
         }
 
         int outlen = 0, final_outlen = 0;
-        EVP_DecryptUpdate(handle->aes_ctx, decrypted, &outlen, temp_buffer, read_size);
-        EVP_DecryptFinal_ex(handle->aes_ctx, decrypted + outlen, &final_outlen);
-
-        // 复制解密后的数据，考虑块内偏移
-        size_t copy_size = size;
-        if (copy_size > (outlen + final_outlen - handle->_seek_block_index)) {
-            copy_size = outlen + final_outlen - handle->_seek_block_index;
+        if (!EVP_DecryptUpdate(handle->aes_ctx, decrypted, &outlen, temp_buffer, read_size)) {
+            free(temp_buffer);
+            free(decrypted);
+            fprintf(stderr, "ERROR: Decryption failed\n");
+            return -1;
         }
-        memcpy(buffer, decrypted + handle->_seek_block_index, copy_size);
+
+        // 处理最后一个块
+        if (!EVP_DecryptFinal_ex(handle->aes_ctx, decrypted + outlen, &final_outlen)) {
+            // 如果不是最后一个块，忽略这个错误
+            if (current_pos + aligned_size < handle->size) {
+                final_outlen = 0;
+            }
+        }
+
+        // 计算实际可用的解密数据大小
+        size_t available_data = outlen + final_outlen - handle->_seek_block_index;
+        size_t copy_size = (size < available_data) ? size : available_data;
+
+        if (copy_size > 0) {
+            memcpy(buffer, decrypted + handle->_seek_block_index, copy_size);
+        }
 
         free(decrypted);
         free(temp_buffer);
+        
         return copy_size;
     }
     
-    // 未加密文件的处理保持不变
+    // 未加密文件的处理
     if (handle->zfile) {
         return zip_fread(handle->zfile, buffer, size);
     }
@@ -1872,78 +1910,91 @@ int ipsw_file_seek(ipsw_file_handle_t handle, int64_t offset, int whence) {
         return -1;
     }
 
-    // 检查是否超出文件范围
-    if (offset < 0 || offset >= handle->size) {
-        fprintf(stderr, "ERROR: Unable to seek to OOB offset 0x%" PRIx64 " (File size: 0x%" PRIx64 ")\n", offset, handle->size);
+    // 计算目标位置
+    int64_t target_pos;
+    if (whence == SEEK_SET) {
+        target_pos = offset;
+    } else if (whence == SEEK_CUR) {
+        if (handle->zfile) {
+            target_pos = zip_ftell(handle->zfile) + offset;
+        } else if (handle->file) {
+            target_pos = ftello(handle->file) + offset;
+        } else {
+            return -1;
+        }
+    } else if (whence == SEEK_END) {
+        target_pos = handle->size + offset;
+    } else {
+        fprintf(stderr, "ERROR: Invalid whence parameter\n");
         return -1;
     }
 
-    // 加密文件需要进行 16 字节对齐
-    if (handle->is_encrypted) {
-        // 将偏移量向下对齐到最近的 16 字节边界
-        int64_t aligned_offset = (offset / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
-        handle->_seek_block_index = offset - aligned_offset; // 记录块内偏移
-        offset = aligned_offset;
+    // 检查边界
+    if (target_pos < 0 || target_pos > handle->size) {
+        fprintf(stderr, "ERROR: Seek target 0x%" PRIx64 " is outside file bounds (0x%" PRIx64 ")\n", 
+                target_pos, handle->size);
+        return -1;
     }
 
-    // ZIP 文件处理
-    if (handle->zfile) {
-        if (!handle->seekable) {
-            fprintf(stderr, "ERROR: Cannot seek in compressed ZIP file!\n");
-            return -1;
-        }
-
-        zip_fclose(handle->zfile);  // 关闭当前 ZIP 句柄
+    // 加密文件处理
+    if (handle->is_encrypted) {
+        // 对齐到AES块大小
+        int64_t aligned_offset = (target_pos / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
+        handle->_seek_block_index = target_pos - aligned_offset;
         
-        // 重新打开文件并设置解密上下文
-        if (handle->is_encrypted) {
+        if (handle->zfile) {
+            // 重新打开文件
+            zip_fclose(handle->zfile);
+            
+            // 重新初始化解密上下文
             const char* key = idevicerestore_get_decryption_key();
             if (!key) {
                 fprintf(stderr, "ERROR: No decryption key available\n");
                 return -1;
             }
-            handle->zfile = zip_fopen_index_encrypted(handle->zip, handle->zindex, ZIP_FL_ENC_GUESS, key);
             
-            // 重新初始化解密上下文
             EVP_CIPHER_CTX_free(handle->aes_ctx);
             handle->aes_ctx = EVP_CIPHER_CTX_new();
             EVP_DecryptInit_ex(handle->aes_ctx, EVP_aes_128_cbc(), NULL, (unsigned char*)key, NULL);
-        } else {
-            handle->zfile = zip_fopen_index(handle->zip, handle->zindex, 0);
-        }
-
-        if (!handle->zfile) {
-            fprintf(stderr, "ERROR: zip_fopen_index failed at offset 0x%" PRIx64 "\n", offset);
-            return -1;
-        }
-
-        // 使用更大的缓冲区跳过数据
-        char temp_buffer[8192];
-        int64_t skipped = 0;
-        while (skipped < offset) {
-            int to_read = (offset - skipped > sizeof(temp_buffer)) ? sizeof(temp_buffer) : (offset - skipped);
-            int64_t read_bytes = zip_fread(handle->zfile, temp_buffer, to_read);
-            if (read_bytes <= 0) {
-                fprintf(stderr, "ERROR: zip_fread failed while skipping to offset 0x%" PRIx64 "\n", skipped);
+            
+            // 打开新的文件句柄
+            handle->zfile = zip_fopen_index_encrypted(handle->zip, handle->zindex, ZIP_FL_ENC_GUESS, key);
+            if (!handle->zfile) {
+                fprintf(stderr, "ERROR: Failed to reopen encrypted file\n");
                 return -1;
             }
-            skipped += read_bytes;
+            
+            // 跳过数据到对齐位置
+            if (aligned_offset > 0) {
+                char temp_buffer[8192];
+                int64_t remaining = aligned_offset;
+                while (remaining > 0) {
+                    size_t to_read = (remaining > sizeof(temp_buffer)) ? sizeof(temp_buffer) : remaining;
+                    int64_t read_bytes = zip_fread(handle->zfile, temp_buffer, to_read);
+                    if (read_bytes <= 0) {
+                        fprintf(stderr, "ERROR: Failed to skip to aligned position\n");
+                        return -1;
+                    }
+                    remaining -= read_bytes;
+                }
+            }
+        } else if (handle->file) {
+            // 对于普通文件，直接定位到对齐位置
+            if (fseeko(handle->file, aligned_offset, SEEK_SET) != 0) {
+                fprintf(stderr, "ERROR: Failed to seek in file\n");
+                return -1;
+            }
         }
-
         return 0;
     }
-
-    // 处理普通文件
-    if (handle->file) {
-        if (handle->is_encrypted) {
-            // 对于加密文件，确保使用对齐的偏移量
-            return fseeko(handle->file, offset, whence);
-        } else {
-            return fseeko(handle->file, offset, whence);
-        }
+    
+    // 未加密文件处理
+    if (handle->zfile) {
+        return zip_fseek(handle->zfile, target_pos, SEEK_SET);
+    } else if (handle->file) {
+        return fseeko(handle->file, target_pos, whence);
     }
-
-    fprintf(stderr, "ERROR: %s: Invalid file handle\n", __func__);
+    
     return -1;
 }
 
