@@ -1788,88 +1788,105 @@ int64_t ipsw_file_read(ipsw_file_handle_t handle, void* buffer, size_t size) {
         return -1;
     }
 
-    // 检查是否超出文件大小
+    // 获取当前位置
     uint64_t current_pos = 0;
     if (handle->zfile) {
         current_pos = zip_ftell(handle->zfile);
     } else if (handle->file) {
         current_pos = ftello(handle->file);
     }
+
+    // 检查并调整请求大小，确保不会超出文件末尾
+    size_t remaining_bytes = (current_pos < handle->size) ? (handle->size - current_pos) : 0;
+    if (size > remaining_bytes) {
+        size = remaining_bytes;
+    }
     
-    if (current_pos + size > handle->size) {
-        size = handle->size - current_pos;
-        if (size == 0) {
-            return 0; // EOF
-        }
+    if (size == 0) {
+        return 0; // EOF
     }
 
     if (handle->is_encrypted) {
-        // 对齐到 AES 块大小
-        size_t aligned_size = ((size + handle->_seek_block_index + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
+        // 计算需要读取的块大小
+        size_t block_aligned_size = ((size + handle->_seek_block_index + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
+        size_t data_offset = handle->_seek_block_index;
         
-        // 确保不会读取超过文件末尾
-        if (current_pos + aligned_size > handle->size) {
-            aligned_size = ((handle->size - current_pos + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
-        }
-        
-        unsigned char* temp_buffer = malloc(aligned_size);
+        // 分配临时缓冲区，确保有足够的空间处理加密数据
+        unsigned char* temp_buffer = malloc(block_aligned_size + AES_BLOCK_SIZE);
         if (!temp_buffer) {
             fprintf(stderr, "ERROR: Out of memory\n");
             return -1;
         }
 
-        // 读取对齐的数据块
-        int64_t read_size;
+        // 确保不会读取超出文件范围的数据
+        size_t read_size = (block_aligned_size <= remaining_bytes) ? 
+                          block_aligned_size : 
+                          ((remaining_bytes + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
+
+        // 读取数据
+        int64_t actual_read;
         if (handle->zfile) {
-            read_size = zip_fread(handle->zfile, temp_buffer, aligned_size);
+            actual_read = zip_fread(handle->zfile, temp_buffer, read_size);
         } else {
-            read_size = fread(temp_buffer, 1, aligned_size, handle->file);
+            actual_read = fread(temp_buffer, 1, read_size, handle->file);
         }
 
-        if (read_size <= 0) {
+        if (actual_read <= 0) {
             free(temp_buffer);
             fprintf(stderr, "ERROR: Read failed at offset 0x%" PRIx64 "\n", current_pos);
             return -1;
         }
 
-        // 解密数据
-        unsigned char* decrypted = malloc(aligned_size + AES_BLOCK_SIZE);
+        // 分配解密缓冲区
+        unsigned char* decrypted = malloc(read_size + AES_BLOCK_SIZE);
         if (!decrypted) {
             free(temp_buffer);
             fprintf(stderr, "ERROR: Out of memory\n");
             return -1;
         }
 
-        int outlen = 0, final_outlen = 0;
-        if (!EVP_DecryptUpdate(handle->aes_ctx, decrypted, &outlen, temp_buffer, read_size)) {
+        // 使用 EVP 接口进行解密
+        int outlen = 0;
+        int final_outlen = 0;
+        EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+        EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, handle->key, handle->iv);
+        EVP_CIPHER_CTX_set_padding(ctx, 0); // 禁用填充
+
+        // 更新解密
+        if (!EVP_DecryptUpdate(ctx, decrypted, &outlen, temp_buffer, actual_read)) {
+            EVP_CIPHER_CTX_free(ctx);
             free(temp_buffer);
             free(decrypted);
             fprintf(stderr, "ERROR: Decryption failed\n");
             return -1;
         }
 
-        // 处理最后一个块
-        if (!EVP_DecryptFinal_ex(handle->aes_ctx, decrypted + outlen, &final_outlen)) {
-            // 如果不是最后一个块，忽略这个错误
-            if (current_pos + aligned_size < handle->size) {
-                final_outlen = 0;
-            }
+        // 处理最后的块
+        EVP_DecryptFinal_ex(ctx, decrypted + outlen, &final_outlen);
+        EVP_CIPHER_CTX_free(ctx);
+
+        // 计算实际可用的解密数据量
+        size_t total_decrypted = outlen + final_outlen;
+        if (data_offset >= total_decrypted) {
+            free(temp_buffer);
+            free(decrypted);
+            return 0;
         }
 
-        // 计算实际可用的解密数据大小
-        size_t available_data = outlen + final_outlen - handle->_seek_block_index;
+        // 计算可以复制的数据量
+        size_t available_data = total_decrypted - data_offset;
         size_t copy_size = (size < available_data) ? size : available_data;
 
-        if (copy_size > 0) {
-            memcpy(buffer, decrypted + handle->_seek_block_index, copy_size);
-        }
+        // 复制解密后的数据到用户缓冲区
+        memcpy(buffer, decrypted + data_offset, copy_size);
 
-        free(decrypted);
         free(temp_buffer);
-        
+        free(decrypted);
+
+        // 返回实际复制的字节数
         return copy_size;
     }
-    
+
     // 未加密文件的处理
     if (handle->zfile) {
         return zip_fread(handle->zfile, buffer, size);
