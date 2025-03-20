@@ -1788,53 +1788,60 @@ int64_t ipsw_file_read(ipsw_file_handle_t handle, void* buffer, size_t size) {
         return -1;
     }
 
-    if (handle->zfile) {
-        zip_int64_t zr = zip_fread(handle->zfile, buffer, size);
-        if (zr < 0) {
-            fprintf(stderr, "ERROR: zip_fread failed\n");
+    if (handle->is_encrypted) {
+        // 计算需要读取的对齐块大小
+        size_t aligned_size = ((size + handle->_seek_block_index + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
+        unsigned char* temp_buffer = malloc(aligned_size);
+        if (!temp_buffer) {
             return -1;
         }
 
-        if (handle->is_encrypted) {
-            unsigned char iv[AES_BLOCK_SIZE] = {0};  
-            unsigned char decrypted_buffer[size + AES_BLOCK_SIZE]; 
-            int outlen = 0, final_outlen = 0;
-
-            EVP_DecryptUpdate(handle->aes_ctx, decrypted_buffer, &outlen, buffer, zr);
-            EVP_DecryptFinal_ex(handle->aes_ctx, decrypted_buffer + outlen, &final_outlen);
-
-            memcpy(buffer, decrypted_buffer, outlen + final_outlen);
-            return (int64_t)(outlen + final_outlen);
+        // 读取对齐的数据块
+        int64_t read_size;
+        if (handle->zfile) {
+            read_size = zip_fread(handle->zfile, temp_buffer, aligned_size);
+        } else {
+            read_size = fread(temp_buffer, 1, aligned_size, handle->file);
         }
 
-        return (int64_t)zr;
-    } 
-
-    if (handle->file) {
-        if (!handle->is_encrypted) {
-            return fread(buffer, 1, size, handle->file);
+        if (read_size < 0) {
+            free(temp_buffer);
+            return -1;
         }
 
-        size_t bytes_read = fread(buffer, 1, size, handle->file);
-        if (bytes_read <= 0) {
-            return bytes_read;
+        // 解密数据
+        unsigned char* decrypted = malloc(aligned_size + AES_BLOCK_SIZE);
+        if (!decrypted) {
+            free(temp_buffer);
+            return -1;
         }
 
-        unsigned char iv[AES_BLOCK_SIZE] = {0};  
-        unsigned char decrypted_buffer[size + AES_BLOCK_SIZE]; 
         int outlen = 0, final_outlen = 0;
+        EVP_DecryptUpdate(handle->aes_ctx, decrypted, &outlen, temp_buffer, read_size);
+        EVP_DecryptFinal_ex(handle->aes_ctx, decrypted + outlen, &final_outlen);
 
-        EVP_DecryptUpdate(handle->aes_ctx, decrypted_buffer, &outlen, buffer, bytes_read);
-        EVP_DecryptFinal_ex(handle->aes_ctx, decrypted_buffer + outlen, &final_outlen);
+        // 复制解密后的数据，考虑块内偏移
+        size_t copy_size = size;
+        if (copy_size > (outlen + final_outlen - handle->_seek_block_index)) {
+            copy_size = outlen + final_outlen - handle->_seek_block_index;
+        }
+        memcpy(buffer, decrypted + handle->_seek_block_index, copy_size);
 
-        memcpy(buffer, decrypted_buffer, outlen + final_outlen);
-        return (int64_t)(outlen + final_outlen);
+        free(decrypted);
+        free(temp_buffer);
+        return copy_size;
+    }
+    
+    // 未加密文件的处理保持不变
+    if (handle->zfile) {
+        return zip_fread(handle->zfile, buffer, size);
+    }
+    if (handle->file) {
+        return fread(buffer, 1, size, handle->file);
     }
 
-    fprintf(stderr, "ERROR: %s: Invalid file handle\n", __func__);
     return -1;
 }
-
 
 /*
 
@@ -1871,6 +1878,14 @@ int ipsw_file_seek(ipsw_file_handle_t handle, int64_t offset, int whence) {
         return -1;
     }
 
+    // 加密文件需要进行 16 字节对齐
+    if (handle->is_encrypted) {
+        // 将偏移量向下对齐到最近的 16 字节边界
+        int64_t aligned_offset = (offset / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
+        handle->_seek_block_index = offset - aligned_offset; // 记录块内偏移
+        offset = aligned_offset;
+    }
+
     // ZIP 文件处理
     if (handle->zfile) {
         if (!handle->seekable) {
@@ -1879,18 +1894,34 @@ int ipsw_file_seek(ipsw_file_handle_t handle, int64_t offset, int whence) {
         }
 
         zip_fclose(handle->zfile);  // 关闭当前 ZIP 句柄
-        handle->zfile = zip_fopen_index(handle->zip, handle->zindex, 0);  // 重新打开文件
+        
+        // 重新打开文件并设置解密上下文
+        if (handle->is_encrypted) {
+            const char* key = idevicerestore_get_decryption_key();
+            if (!key) {
+                fprintf(stderr, "ERROR: No decryption key available\n");
+                return -1;
+            }
+            handle->zfile = zip_fopen_index_encrypted(handle->zip, handle->zindex, ZIP_FL_ENC_GUESS, key);
+            
+            // 重新初始化解密上下文
+            EVP_CIPHER_CTX_free(handle->aes_ctx);
+            handle->aes_ctx = EVP_CIPHER_CTX_new();
+            EVP_DecryptInit_ex(handle->aes_ctx, EVP_aes_128_cbc(), NULL, (unsigned char*)key, NULL);
+        } else {
+            handle->zfile = zip_fopen_index(handle->zip, handle->zindex, 0);
+        }
 
         if (!handle->zfile) {
             fprintf(stderr, "ERROR: zip_fopen_index failed at offset 0x%" PRIx64 "\n", offset);
             return -1;
         }
 
-        // 🚀 **优化 `zip_fread` 跳过数据**
-        char temp_buffer[4096];
+        // 使用更大的缓冲区跳过数据
+        char temp_buffer[8192];
         int64_t skipped = 0;
         while (skipped < offset) {
-            int to_read = (offset - skipped > 4096) ? 4096 : (offset - skipped);
+            int to_read = (offset - skipped > sizeof(temp_buffer)) ? sizeof(temp_buffer) : (offset - skipped);
             int64_t read_bytes = zip_fread(handle->zfile, temp_buffer, to_read);
             if (read_bytes <= 0) {
                 fprintf(stderr, "ERROR: zip_fread failed while skipping to offset 0x%" PRIx64 "\n", skipped);
@@ -1904,13 +1935,17 @@ int ipsw_file_seek(ipsw_file_handle_t handle, int64_t offset, int whence) {
 
     // 处理普通文件
     if (handle->file) {
-        return fseeko(handle->file, offset, whence);
+        if (handle->is_encrypted) {
+            // 对于加密文件，确保使用对齐的偏移量
+            return fseeko(handle->file, offset, whence);
+        } else {
+            return fseeko(handle->file, offset, whence);
+        }
     }
 
     fprintf(stderr, "ERROR: %s: Invalid file handle\n", __func__);
     return -1;
 }
-
 
 
 int64_t ipsw_file_tell(ipsw_file_handle_t handle)
@@ -1958,4 +1993,3 @@ const char* ipsw_strerror(int errcode)
             return "Unknown error";
     }
 }
-
