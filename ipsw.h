@@ -83,7 +83,9 @@ typedef struct ipsw_file_handle {
     size_t _seek_block_index; //  记录加密文件的块偏移
     zip_int64_t zindex;  // 新增 zindex 记录文件在 zip 内的索引
     EVP_CIPHER_CTX *aes_ctx; // OpenSSL 3.0 需要 EVP_CIPHER_CTX_new()
-} *ipsw_file_handle_t;
+    unsigned char iv[16];  // 添加 IV 存储
+    int last_block_processed;  // 标记是否处理了最后一个块
+};
 
 
 typedef struct ipsw_file_handle* ipsw_file_handle_t;
