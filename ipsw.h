@@ -28,6 +28,7 @@
 extern "C" {
 #endif
 
+#include <stdio.h>
 #include <stdint.h>
 #include <plist/plist.h>
 #include <sys/stat.h>
@@ -73,6 +74,15 @@ int ipsw_print_info(const char* ipsw);
 typedef int (*ipsw_list_cb)(void *ctx, ipsw_archive_t ipsw, const char *name, struct stat *stat);
 typedef int (*ipsw_send_cb)(void *ctx, void *data, size_t size, size_t done, size_t total_size);
 
+
+// 添加缓存结构
+typedef struct {
+    unsigned char* data;  // Cached data buffer
+    size_t capacity;      // Total size of the buffer
+    size_t size;          // Current amount of valid data
+    uint64_t offset;      // File offset where cache starts
+} seek_cache_t;
+
 typedef struct ipsw_file_handle {
     FILE* file;
     struct zip* zip;
@@ -87,7 +97,13 @@ typedef struct ipsw_file_handle {
     unsigned char iv[16];
     uint64_t current_block;
     int last_block_size;
+    seek_cache_t* cache;
+    uint64_t last_read_pos;
 } *ipsw_file_handle_t;
+
+
+
+
 
 
 typedef struct ipsw_file_handle* ipsw_file_handle_t;
@@ -102,7 +118,9 @@ void ipsw_file_close(ipsw_file_handle_t handle);
 
 uint64_t ipsw_file_size(ipsw_file_handle_t handle);
 int64_t ipsw_file_read(ipsw_file_handle_t handle, void* buffer, size_t size);
+
 int ipsw_file_seek(ipsw_file_handle_t handle, int64_t offset, int whence);
+
 int64_t ipsw_file_tell(ipsw_file_handle_t handle);
 
 int ipsw_is_directory(const char* ipsw);
