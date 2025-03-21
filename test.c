@@ -132,48 +132,69 @@ ipsw_archive_t ipsw_open_with_callback(const char* ipsw, decrypt_key_callback_t 
     archive->path = strdup(ipsw);
     return archive;
 }
-/*
-ipsw_archive_t ipsw_open_with_callback0(const char* ipsw, decrypt_key_callback_t callback, void* user_data)
-{
-    if (!ipsw) {
-        error("ERROR: Invalid IPSW path\n");
-        return NULL;
+
+
+int main(int argc, char* argv[]) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <ipsw_path> <file_path>\n", argv[0]);
+        return 1;
     }
 
-    int err = 0;
-    ipsw_archive_t archive = (ipsw_archive_t)calloc(1, sizeof(struct ipsw_archive));
-    if (!archive) {
-        error("ERROR: Out of memory\n");
-        return NULL;
+    const char* ipsw_path = argv[1];
+    const char* file_path = argv[2];
+    const char* key = idevicerestore_get_decryption_key();
+
+    ipsw_file_handle_t handle = ipsw_file_open(ipsw_path, file_path, key);
+    if (!handle) {
+        fprintf(stderr, "Failed to open IPSW file\n");
+        return 1;
     }
 
-    struct stat fst;
-    if (stat(ipsw, &fst) != 0) {
-        error("ERROR: ipsw_open_with_callback %s: %s\n", ipsw, strerror(errno));
-        free(archive);
-        return NULL;
-    }
+    unsigned char buffer[4096];
+    int64_t bytes_read;
 
-    if (S_ISDIR(fst.st_mode)) {
-        archive->zip = 0;
-        archive->key_callback = NULL;
-        archive->key_user_data = NULL;
-    } else {
-        struct zip *zip = zip_open(ipsw, 0, &err);
-        if (!zip) {
-            error("ERROR: zip_open: %s: %d\n", ipsw, err);
-            free(archive);
-            return NULL;
-        }
-        archive->zip = 1;
-        archive->key_callback = callback;
-        archive->key_user_data = user_data;
+    if (ipsw_file_seek(handle, 0xbbb0a4a0, SEEK_SET) < 0) {
+        fprintf(stderr, "ERROR: Unable to seek to OOB offset 0x%llx\n", (unsigned long long)0xbbb0a4a0);
+        ipsw_file_close(handle);
+        return 1;
     }
+    bytes_read = ipsw_file_read(handle, buffer, 1276);
+    if (bytes_read < 0) {
+        fprintf(stderr, "Failed to read from offset 0xbbb0a4a0\n");
+        ipsw_file_close(handle);
+        return 1;
+    }
+    fprintf(stderr, "Read %lld bytes from offset 0xbbb0a4a0\n", (long long)bytes_read);
 
-    archive->path = strdup(ipsw);
-    return archive;
+    if (ipsw_file_seek(handle, 0, SEEK_SET) < 0) {
+        fprintf(stderr, "ERROR: Unable to seek to OOB offset 0x0\n");
+        ipsw_file_close(handle);
+        return 1;
+    }
+    bytes_read = ipsw_file_read(handle, buffer, 72);
+    if (bytes_read < 0) {
+        fprintf(stderr, "Failed to read from offset 0x0\n");
+        ipsw_file_close(handle);
+        return 1;
+    }
+    fprintf(stderr, "Read %lld bytes from offset 0x0\n", (long long)bytes_read);
+
+    if (ipsw_file_seek(handle, 0xbbb0a79c, SEEK_SET) < 0) {
+        fprintf(stderr, "ERROR: Unable to seek to OOB offset 0x%llx\n", (unsigned long long)0xbbb0a79c);
+        ipsw_file_close(handle);
+        return 1;
+    }
+    bytes_read = ipsw_file_read(handle, buffer, 512);
+    if (bytes_read < 0) {
+        fprintf(stderr, "Failed to read from offset 0xbbb0a79c\n");
+        ipsw_file_close(handle);
+        return 1;
+    }
+    fprintf(stderr, "Read %lld bytes from offset 0xbbb0a79c\n", (long long)bytes_read);
+
+    ipsw_file_close(handle);
+    return 0;
 }
-*/
 
 int ipsw_print_info(const char* path)
 {
@@ -1586,6 +1607,232 @@ void ipsw_cancel(void)
 }
 
 
+
+#include <errno.h>
+#include <string.h>
+#include <inttypes.h>
+#include <openssl/err.h>
+#include "ipsw.h"
+
+static seek_cache_t* create_seek_cache(size_t capacity) {
+    seek_cache_t* cache = (seek_cache_t*)calloc(1, sizeof(seek_cache_t));
+    if (!cache) return NULL;
+    
+    cache->data = (unsigned char*)malloc(capacity);
+    if (!cache->data) {
+        free(cache);
+        return NULL;
+    }
+    
+    cache->capacity = capacity;
+    cache->size = 0;
+    cache->offset = 0;
+    return cache;
+}
+
+ipsw_file_handle_t ipsw_file_open(const char* ipsw_path, const char* file_path, const char* key) {
+    ipsw_file_handle_t handle = (ipsw_file_handle_t)calloc(1, sizeof(struct ipsw_file_handle));
+    if (!handle) {
+        fprintf(stderr, "ERROR: %s: Failed to allocate handle\n", __func__);
+        fflush(stderr);
+        return NULL;
+    }
+
+    struct zip* zip = zip_open(ipsw_path, ZIP_RDONLY, NULL);
+    if (!zip) {
+        fprintf(stderr, "ERROR: %s: Failed to open IPSW %s\n", __func__, ipsw_path);
+        fflush(stderr);
+        free(handle);
+        return NULL;
+    }
+
+    zip_int64_t index = zip_name_locate(zip, file_path, 0);
+    if (index < 0) {
+        fprintf(stderr, "ERROR: %s: Failed to locate %s in IPSW\n", __func__, file_path);
+        fflush(stderr);
+        zip_close(zip);
+        free(handle);
+        return NULL;
+    }
+
+    struct zip_stat zstat;
+    if (zip_stat_index(zip, index, 0, &zstat) < 0) {
+        fprintf(stderr, "ERROR: %s: Failed to stat file at index %lld\n", __func__, (long long)index);
+        fflush(stderr);
+        zip_close(zip);
+        free(handle);
+        return NULL;
+    }
+
+    struct zip_file* zfile;
+    if (key) {
+        zfile = zip_fopen_index_encrypted(zip, index, 0, key);
+        handle->is_encrypted = 1;
+    } else {
+        zfile = zip_fopen_index(zip, index, 0);
+        handle->is_encrypted = 0;
+    }
+    if (!zfile) {
+        fprintf(stderr, "ERROR: %s: Failed to open file at index %lld, encrypted = %d\n",
+                __func__, (long long)index, handle->is_encrypted);
+        fflush(stderr);
+        zip_close(zip);
+        free(handle);
+        return NULL;
+    }
+
+    handle->zip = zip;
+    handle->zfile = zfile;
+    handle->size = zstat.size;
+    handle->zindex = index;
+    handle->seekable = 1; // Assume seekable unless proven otherwise
+    return handle;
+}
+
+int ipsw_file_seek(ipsw_file_handle_t handle, int64_t offset, int whence) {
+    if (!handle) {
+        fprintf(stderr, "ERROR: %s: Invalid file handle\n", __func__);
+        fflush(stderr);
+        return -1;
+    }
+
+    int64_t current_pos = handle->zfile ? zip_ftell(handle->zfile) : (handle->file ? ftello(handle->file) : -1);
+    if (current_pos < 0) {
+        fprintf(stderr, "ERROR: Failed to get current position, errno: %s\n", strerror(errno));
+        fflush(stderr);
+        return -1;
+    }
+
+    int64_t target_pos;
+    if (whence == SEEK_SET) {
+        target_pos = offset;
+    } else if (whence == SEEK_CUR) {
+        target_pos = current_pos + offset;
+    } else if (whence == SEEK_END) {
+        target_pos = handle->size + offset;
+    } else {
+        fprintf(stderr, "ERROR: Invalid whence parameter\n");
+        fflush(stderr);
+        return -1;
+    }
+
+    fprintf(stderr, "DEBUG: Seeking from 0x%llx to 0x%llx (whence = %d)\n",
+            (unsigned long long)current_pos, (unsigned long long)target_pos, whence);
+    fflush(stderr);
+
+    if (target_pos < 0 || target_pos > handle->size) {
+        fprintf(stderr, "ERROR: Seek target 0x%llx outside bounds (0x%llx)\n",
+                (unsigned long long)target_pos, (unsigned long long)handle->size);
+        fflush(stderr);
+        return -1;
+    }
+
+    if (handle->is_encrypted) {
+        int64_t aligned_offset = (target_pos / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
+        handle->_seek_block_index = target_pos - aligned_offset;
+
+        if (handle->zfile) {
+            fprintf(stderr, "DEBUG: Seekable = %d, attempting direct seek to 0x%llx\n",
+                    handle->seekable, (unsigned long long)aligned_offset);
+            fflush(stderr);
+
+            if (current_pos != aligned_offset) {
+                if (zip_fseek(handle->zfile, aligned_offset, SEEK_SET) == 0) {
+                    fprintf(stderr, "DEBUG: Direct zip_fseek to 0x%llx succeeded\n",
+                            (unsigned long long)aligned_offset);
+                    fflush(stderr);
+                    goto success;
+                }
+                fprintf(stderr, "WARNING: zip_fseek to 0x%llx failed, errno: %s, attempting fallback\n",
+                        (unsigned long long)aligned_offset, strerror(errno));
+                fflush(stderr);
+
+                zip_fclose(handle->zfile);
+                const char* key = idevicerestore_get_decryption_key();
+                if (!key) {
+                    fprintf(stderr, "ERROR: No decryption key available\n");
+                    fflush(stderr);
+                    return -1;
+                }
+                handle->zfile = zip_fopen_index_encrypted(handle->zip, handle->zindex, 0, key);
+                if (!handle->zfile) {
+                    fprintf(stderr, "ERROR: Failed to reopen encrypted file\n");
+                    fflush(stderr);
+                    return -1;
+                }
+                fprintf(stderr, "DEBUG: Reopened file at 0x0\n");
+                fflush(stderr);
+
+                int64_t to_skip = aligned_offset;
+                fprintf(stderr, "DEBUG: Forcing read-and-skip from 0x0 to 0x%llx\n",
+                        (unsigned long long)aligned_offset);
+                fflush(stderr);
+
+                char temp_buffer[32768];
+                int64_t total_skipped = 0;
+                const int64_t log_interval = 1024 * 1024;
+                while (to_skip > 0) {
+                    size_t chunk = (to_skip > sizeof(temp_buffer)) ? sizeof(temp_buffer) : to_skip;
+                    ssize_t read_bytes = zip_fread(handle->zfile, temp_buffer, chunk);
+                    if (read_bytes <= 0) {
+                        fprintf(stderr, "ERROR: Failed to skip %zu bytes at 0x%llx, read returned %zd, errno: %s\n",
+                                chunk, (unsigned long long)(aligned_offset - to_skip), read_bytes, strerror(errno));
+                        fflush(stderr);
+                        zip_fclose(handle->zfile);
+                        handle->zfile = NULL;
+                        return -1;
+                    }
+                    to_skip -= read_bytes;
+                    total_skipped += read_bytes;
+                    if (total_skipped % log_interval == 0 || to_skip == 0) {
+                        fprintf(stderr, "DEBUG: Skipped %lld bytes total, remaining to skip: 0x%llx\n",
+                                (long long)total_skipped, (unsigned long long)to_skip);
+                        fflush(stderr);
+                    }
+                }
+            } else {
+                fprintf(stderr, "DEBUG: No seek needed, already at 0x%llx\n",
+                        (unsigned long long)aligned_offset);
+                fflush(stderr);
+            }
+success:
+            if (handle->cache && (aligned_offset < handle->cache->offset || 
+                                  aligned_offset >= handle->cache->offset + handle->cache->size)) {
+                handle->cache->size = 0;
+                fprintf(stderr, "DEBUG: Cache invalidated due to seek to 0x%llx\n",
+                        (unsigned long long)aligned_offset);
+                fflush(stderr);
+            }
+            fprintf(stderr, "DEBUG: Seeked to aligned offset 0x%llx, block_index = %lld\n",
+                    (unsigned long long)aligned_offset, (long long)handle->_seek_block_index);
+            fflush(stderr);
+            return 0;
+        } else if (handle->file) {
+            if (fseeko(handle->file, aligned_offset, SEEK_SET) != 0) {
+                fprintf(stderr, "ERROR: fseeko to 0x%llx failed, errno: %s\n",
+                        (unsigned long long)aligned_offset, strerror(errno));
+                fflush(stderr);
+                return -1;
+            }
+            return 0;
+        }
+    }
+
+    if (handle->zfile) {
+        if (zip_fseek(handle->zfile, target_pos, SEEK_SET) < 0) {
+            fprintf(stderr, "ERROR: zip_fseek to 0x%llx failed, errno: %s\n",
+                    (unsigned long long)target_pos, strerror(errno));
+            fflush(stderr);
+            return -1;
+        }
+        return 0;
+    } else if (handle->file) {
+        return fseeko(handle->file, target_pos, SEEK_SET);
+    }
+
+    return -1;
+}
+
 // 文件句柄操作实现
 ipsw_file_handle_t ipsw_file_open(ipsw_archive_t ipsw, const char* path) {
     ipsw_file_handle_t handle = (ipsw_file_handle_t)calloc(1, sizeof(struct ipsw_file_handle));
@@ -1656,294 +1903,44 @@ ipsw_file_handle_t ipsw_file_open(ipsw_archive_t ipsw, const char* path) {
     return handle;
 }
 
-/*
-ipsw_file_handle_t ipsw_file_open1(ipsw_archive_t ipsw, const char* path) {
-    ipsw_file_handle_t handle = (ipsw_file_handle_t)calloc(1, sizeof(struct ipsw_file_handle));
-    if (!handle) return NULL;
 
-    if (ipsw->zip) {
-        int err = 0;
-        struct zip *zip = zip_open(ipsw->path, 0, &err);
-        if (!zip) {
-            error("ERROR: zip_open: %s: %d\n", ipsw->path, err);
-            free(handle);
-            return NULL;
-        }
 
-        zip_stat_t zst;
-        zip_int64_t zindex = zip_name_locate(zip, path, 0);
-        if (zindex < 0) {
-            error("ERROR: zip_name_locate: %s not found\n", path);
-            zip_unchange_all(zip);
-            zip_close(zip);
-            free(handle);
-            return NULL;
-        }
+int ipsw_file_close(ipsw_file_handle_t handle) {
+    if (!handle) return -1;
 
-        zip_stat_init(&zst);
-        if (zip_stat_index(zip, zindex, 0, &zst) != 0) {
-            error("ERROR: zip_stat_index: %s\n", path);
-            zip_unchange_all(zip);
-            zip_close(zip);
-            free(handle);
-            return NULL;
-        }
-
-        handle->size = zst.size;
-        handle->seekable = (zst.comp_method == ZIP_CM_STORE);
-        handle->zip = zip;
-        handle->is_encrypted = (zst.encryption_method != 0) ? 1 : 0;
-
-        if (handle->is_encrypted) {
-            const char* key = idevicerestore_get_decryption_key();
-            if (!key) {
-                error("ERROR: No decryption key available for encrypted file: %s\n", path);
-                zip_unchange_all(zip);
-                zip_close(zip);
-                free(handle);
-                return NULL;
-            }
-            AES_set_decrypt_key((unsigned char*)key, 128, &handle->aes_ctx);
-        }
-    } else {
-        struct stat st;
-        char *filepath = build_path(ipsw->path, path);
-        handle->file = fopen(filepath, "rb");
-        free(filepath);
-        if (!handle->file) {
-            error("ERROR: fopen: %s could not be opened\n", path);
-            free(handle);
-            return NULL;
-        }
-        fstat(fileno(handle->file), &st);
-        handle->size = st.st_size;
-        handle->seekable = 1;
-    }
-    return handle;
-}*/
-
-/*
-void ipsw_file_close(ipsw_file_handle_t handle)
-{
-	if (handle && handle->zfile) {
-		zip_fclose(handle->zfile);
-		zip_unchange_all(handle->zip);
-		zip_close(handle->zip);
-	} else if (handle && handle->file) {
-		fclose(handle->file);
-	}
-	free(handle);
-}
-*/
-
-void ipsw_file_close(ipsw_file_handle_t handle) {
-    if (!handle) return;
-
+    int ret = 0;
     if (handle->zfile) {
-        zip_fclose(handle->zfile);
-    }
-    if (handle->zip) {
-        zip_close(handle->zip);
+        if (zip_fclose(handle->zfile) < 0) {
+            fprintf(stderr, "ERROR: %s: Failed to close zip file\n", __func__);
+            fflush(stderr);
+            ret = -1;
+        }
     }
     if (handle->file) {
-        fclose(handle->file);
+        if (fclose(handle->file) != 0) {
+            fprintf(stderr, "ERROR: %s: Failed to close file\n", __func__);
+            fflush(stderr);
+            ret = -1;
+        }
     }
-    if (handle->is_encrypted && handle->aes_ctx) {
-        EVP_CIPHER_CTX_free(handle->aes_ctx);  // ✅ 释放 OpenSSL 解密上下文
+    if (handle->zip) {
+        if (zip_close(handle->zip) < 0) {
+            fprintf(stderr, "ERROR: %s: Failed to close zip archive\n", __func__);
+            fflush(stderr);
+            ret = -1;
+        }
     }
-    
+    if (handle->cache) {
+        if (handle->cache->data) free(handle->cache->data);
+        free(handle->cache);
+    }
     free(handle);
+    return ret;
 }
 
 
 
-uint64_t ipsw_file_size(ipsw_file_handle_t handle)
-{
-	if (handle) {
-		return handle->size;
-	}
-	return 0;
-}
-
-/*
-int64_t ipsw_file_read(ipsw_file_handle_t handle, void* buffer, size_t size)
-{
-	if (handle && handle->zfile) {
-		zip_int64_t zr = zip_fread(handle->zfile, buffer, size);
-		return (int64_t)zr;
-	} else if (handle && handle->file) {
-		return fread(buffer, 1, size, handle->file);
-	} else {
-		error("ERROR: %s: Invalid file handle\n", __func__);
-		return -1;
-	}
-}
-*/
-
-#include <errno.h>
-#include <string.h>
-#include <inttypes.h>
-#include <openssl/err.h>
-#include "ipsw.h"
-
-static seek_cache_t* create_seek_cache(size_t capacity) {
-    seek_cache_t* cache = (seek_cache_t*)calloc(1, sizeof(seek_cache_t));
-    if (!cache) return NULL;
-    
-    cache->data = (unsigned char*)malloc(capacity);
-    if (!cache->data) {
-        free(cache);
-        return NULL;
-    }
-    
-    cache->capacity = capacity;
-    cache->size = 0;
-    cache->offset = 0;
-    return cache;
-}
-
-int ipsw_file_seek(ipsw_file_handle_t handle, int64_t offset, int whence) {
-    if (!handle) {
-        fprintf(stderr, "ERROR: %s: Invalid file handle\n", __func__);
-        fflush(stderr);
-        return -1;
-    }
-
-    int64_t current_pos = handle->zfile ? zip_ftell(handle->zfile) : (handle->file ? ftello(handle->file) : -1);
-    if (current_pos < 0) {
-        fprintf(stderr, "ERROR: Failed to get current position, errno: %s\n", strerror(errno));
-        fflush(stderr);
-        return -1;
-    }
-
-    int64_t target_pos;
-    if (whence == SEEK_SET) {
-        target_pos = offset;
-    } else if (whence == SEEK_CUR) {
-        target_pos = current_pos + offset;
-    } else if (whence == SEEK_END) {
-        target_pos = handle->size + offset;
-    } else {
-        fprintf(stderr, "ERROR: Invalid whence parameter\n");
-        fflush(stderr);
-        return -1;
-    }
-
-    fprintf(stderr, "DEBUG: Seeking from 0x%llx to 0x%llx (whence = %d)\n",
-            (unsigned long long)current_pos, (unsigned long long)target_pos, whence);
-    fflush(stderr);
-
-    if (target_pos < 0 || target_pos > handle->size) {
-        fprintf(stderr, "ERROR: Seek target 0x%llx outside bounds (0x%llx)\n",
-                (unsigned long long)target_pos, (unsigned long long)handle->size);
-        fflush(stderr);
-        return -1;
-    }
-
-    if (handle->is_encrypted) {
-        int64_t aligned_offset = (target_pos / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
-        handle->_seek_block_index = target_pos - aligned_offset;
-
-        if (handle->zfile) {
-            fprintf(stderr, "DEBUG: Seekable = %d, attempting direct seek to 0x%llx\n",
-                    handle->seekable, (unsigned long long)aligned_offset);
-            fflush(stderr);
-
-            if (current_pos != aligned_offset) {
-                if (zip_fseek(handle->zfile, aligned_offset, SEEK_SET) == 0) {
-                    fprintf(stderr, "DEBUG: Direct zip_fseek to 0x%llx succeeded\n",
-                            (unsigned long long)aligned_offset);
-                    fflush(stderr);
-                    goto success;
-                }
-                fprintf(stderr, "WARNING: zip_fseek to 0x%llx failed, errno: %s, attempting fallback\n",
-                        (unsigned long long)aligned_offset, strerror(errno));
-                fflush(stderr);
-
-                int64_t to_skip = aligned_offset - current_pos;
-                fprintf(stderr, "DEBUG: Forcing read-and-skip from 0x%llx to 0x%llx\n",
-                        (unsigned long long)current_pos, (unsigned long long)aligned_offset);
-                fflush(stderr);
-
-                char temp_buffer[32768];
-                int64_t total_skipped = 0;
-                const int64_t log_interval = 1024 * 1024;
-
-                if (to_skip < 0) {
-                    if (zip_fseek(handle->zfile, 0, SEEK_SET) != 0) {
-                        fprintf(stderr, "ERROR: Failed to reset to 0x0, errno: %s\n", strerror(errno));
-                        fflush(stderr);
-                        return -1;
-                    }
-                    current_pos = 0;
-                    to_skip = aligned_offset;
-                    fprintf(stderr, "DEBUG: Reset to 0x0, now skipping forward to 0x%llx\n",
-                            (unsigned long long)aligned_offset);
-                    fflush(stderr);
-                }
-
-                while (to_skip > 0) {
-                    size_t chunk = (to_skip > sizeof(temp_buffer)) ? sizeof(temp_buffer) : to_skip;
-                    ssize_t read_bytes = zip_fread(handle->zfile, temp_buffer, chunk);
-                    if (read_bytes <= 0) {
-                        fprintf(stderr, "ERROR: Failed to skip %zu bytes at 0x%llx, read returned %zd, errno: %s\n",
-                                chunk, (unsigned long long)(aligned_offset - to_skip), read_bytes, strerror(errno));
-                        fflush(stderr);
-                        return -1;
-                    }
-                    to_skip -= read_bytes;
-                    total_skipped += read_bytes;
-                    if (total_skipped % log_interval == 0 || to_skip == 0) {
-                        fprintf(stderr, "DEBUG: Skipped %lld bytes total, remaining to skip: 0x%llx\n",
-                                (long long)total_skipped, (unsigned long long)to_skip);
-                        fflush(stderr);
-                    }
-                }
-            } else {
-                fprintf(stderr, "DEBUG: No seek needed, already at 0x%llx\n",
-                        (unsigned long long)aligned_offset);
-                fflush(stderr);
-            }
-success:
-            if (handle->cache && (aligned_offset < handle->cache->offset || 
-                                  aligned_offset >= handle->cache->offset + handle->cache->size)) {
-                handle->cache->size = 0; // Invalidate cache
-                fprintf(stderr, "DEBUG: Cache invalidated due to seek to 0x%llx\n",
-                        (unsigned long long)aligned_offset);
-                fflush(stderr);
-            }
-            fprintf(stderr, "DEBUG: Seeked to aligned offset 0x%llx, block_index = %lld\n",
-                    (unsigned long long)aligned_offset, (long long)handle->_seek_block_index);
-            fflush(stderr);
-            return 0;
-        } else if (handle->file) {
-            if (fseeko(handle->file, aligned_offset, SEEK_SET) != 0) {
-                fprintf(stderr, "ERROR: fseeko to 0x%llx failed, errno: %s\n",
-                        (unsigned long long)aligned_offset, strerror(errno));
-                fflush(stderr);
-                return -1;
-            }
-            return 0;
-        }
-    }
-
-    if (handle->zfile) {
-        if (zip_fseek(handle->zfile, target_pos, SEEK_SET) < 0) {
-            fprintf(stderr, "ERROR: zip_fseek to 0x%llx failed, errno: %s\n",
-                    (unsigned long long)target_pos, strerror(errno));
-            fflush(stderr);
-            return -1;
-        }
-        return 0;
-    } else if (handle->file) {
-        return fseeko(handle->file, target_pos, SEEK_SET);
-    }
-
-    return -1;
-}
-
-int64_t ipsw_file_read(ipsw_file_handle_t handle, void* buffer, size_t size) 
-{
+int64_t ipsw_file_read(ipsw_file_handle_t handle, void* buffer, size_t size) {
     if (!handle) {
         fprintf(stderr, "ERROR: %s: Invalid file handle\n", __func__);
         fflush(stderr);
@@ -2067,6 +2064,19 @@ int64_t ipsw_file_read(ipsw_file_handle_t handle, void* buffer, size_t size)
 }
 
 
+
+
+
+
+
+
+uint64_t ipsw_file_size(ipsw_file_handle_t handle)
+{
+	if (handle) {
+		return handle->size;
+	}
+	return 0;
+}
 
 
 
