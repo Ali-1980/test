@@ -50,6 +50,8 @@
 #define TO_FILE_BLOCK_SIZE 32768 // 设定块大小
 #define AES_BLOCK_SIZE 16 
 
+
+
 static int cancel_flag = 0;
 
 // 内部辅助函数，用于构建完整路径
@@ -766,7 +768,7 @@ int ipsw_extract_to_memory(ipsw_archive_t ipsw, const char* infile, unsigned cha
 
         // **检查文件是否加密**
 	    if (zstat.encryption_method != 0) {
-	        printf("[%s] File '%s' is encrypted\n", __func__, infile);
+	       // printf("[%s] File '%s' is encrypted\n", __func__, infile);
 	        
 	        // 获取密钥
 	        const char* key = idevicerestore_get_decryption_key();
@@ -775,8 +777,6 @@ int ipsw_extract_to_memory(ipsw_archive_t ipsw, const char* infile, unsigned cha
 	            zip_close(zip);
 	            return IPSW_E_ENCRYPTED;
 	        }
-	        
-	        printf("[%s] Using key: %s\n", __func__, key);
 	        if (zip_set_default_password(zip, key) != 0) {
 	            fprintf(stderr, "[%s] ERROR: Failed to set ZIP decryption password\n", __func__);
 	            zip_close(zip);
@@ -1780,240 +1780,295 @@ int64_t ipsw_file_read(ipsw_file_handle_t handle, void* buffer, size_t size)
 }
 */
 
+#include <errno.h>
+#include <string.h>
+#include <inttypes.h>
+#include <openssl/err.h>
+#include "ipsw.h"
 
-
-int64_t ipsw_file_read(ipsw_file_handle_t handle, void* buffer, size_t size) {
-    if (!handle) {
-        fprintf(stderr, "ERROR: %s: Invalid file handle\n", __func__);
-        return -1;
-    }
-
-    // 获取当前位置
-    uint64_t current_pos = 0;
-    if (handle->zfile) {
-        current_pos = zip_ftell(handle->zfile);
-    } else if (handle->file) {
-        current_pos = ftello(handle->file);
-    }
-
-    // 检查并调整请求大小，确保不会超出文件末尾
-    size_t remaining_bytes = (current_pos < handle->size) ? (handle->size - current_pos) : 0;
-    if (size > remaining_bytes) {
-        size = remaining_bytes;
+static seek_cache_t* create_seek_cache(size_t capacity) {
+    seek_cache_t* cache = (seek_cache_t*)calloc(1, sizeof(seek_cache_t));
+    if (!cache) return NULL;
+    
+    cache->data = (unsigned char*)malloc(capacity);
+    if (!cache->data) {
+        free(cache);
+        return NULL;
     }
     
-    if (size == 0) {
-        return 0; // EOF
-    }
-
-    if (handle->is_encrypted) {
-        // 计算需要读取的块大小
-        size_t block_aligned_size = ((size + handle->_seek_block_index + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
-        size_t data_offset = handle->_seek_block_index;
-        
-        // 分配临时缓冲区，确保有足够的空间处理加密数据
-        unsigned char* temp_buffer = malloc(block_aligned_size + AES_BLOCK_SIZE);
-        if (!temp_buffer) {
-            fprintf(stderr, "ERROR: Out of memory\n");
-            return -1;
-        }
-
-        // 确保不会读取超出文件范围的数据
-        size_t read_size = (block_aligned_size <= remaining_bytes) ? 
-                          block_aligned_size : 
-                          ((remaining_bytes + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
-
-        // 读取数据
-        int64_t actual_read;
-        if (handle->zfile) {
-            actual_read = zip_fread(handle->zfile, temp_buffer, read_size);
-        } else {
-            actual_read = fread(temp_buffer, 1, read_size, handle->file);
-        }
-
-        if (actual_read <= 0) {
-            free(temp_buffer);
-            fprintf(stderr, "ERROR: Read failed at offset 0x%" PRIx64 "\n", current_pos);
-            return -1;
-        }
-
-        // 分配解密缓冲区
-        unsigned char* decrypted = malloc(read_size + AES_BLOCK_SIZE);
-        if (!decrypted) {
-            free(temp_buffer);
-            fprintf(stderr, "ERROR: Out of memory\n");
-            return -1;
-        }
-
-        // 使用 EVP 接口进行解密
-        int outlen = 0;
-        int final_outlen = 0;
-        EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-        EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, handle->key, handle->iv);
-        EVP_CIPHER_CTX_set_padding(ctx, 0); // 禁用填充
-
-        // 更新解密
-        if (!EVP_DecryptUpdate(ctx, decrypted, &outlen, temp_buffer, actual_read)) {
-            EVP_CIPHER_CTX_free(ctx);
-            free(temp_buffer);
-            free(decrypted);
-            fprintf(stderr, "ERROR: Decryption failed\n");
-            return -1;
-        }
-
-        // 处理最后的块
-        EVP_DecryptFinal_ex(ctx, decrypted + outlen, &final_outlen);
-        EVP_CIPHER_CTX_free(ctx);
-
-        // 计算实际可用的解密数据量
-        size_t total_decrypted = outlen + final_outlen;
-        if (data_offset >= total_decrypted) {
-            free(temp_buffer);
-            free(decrypted);
-            return 0;
-        }
-
-        // 计算可以复制的数据量
-        size_t available_data = total_decrypted - data_offset;
-        size_t copy_size = (size < available_data) ? size : available_data;
-
-        // 复制解密后的数据到用户缓冲区
-        memcpy(buffer, decrypted + data_offset, copy_size);
-
-        free(temp_buffer);
-        free(decrypted);
-
-        // 返回实际复制的字节数
-        return copy_size;
-    }
-
-    // 未加密文件的处理
-    if (handle->zfile) {
-        return zip_fread(handle->zfile, buffer, size);
-    }
-    if (handle->file) {
-        return fread(buffer, 1, size, handle->file);
-    }
-
-    return -1;
+    cache->capacity = capacity;
+    cache->size = 0;
+    cache->offset = 0;
+    return cache;
 }
-
-/*
-
-int ipsw_file_seek(ipsw_file_handle_t handle, int64_t offset, int whence)
-{
-	if (handle && handle->zfile) {
-		return zip_fseek(handle->zfile, offset, whence);
-	} else if (handle && handle->file) {
-#ifdef WIN32
-		if (whence == SEEK_SET) {
-			rewind(handle->file);
-		}
-		return (_lseeki64(fileno(handle->file), offset, whence) < 0) ? -1 : 0;
-#else
-		return fseeko(handle->file, offset, whence);
-#endif
-	} else {
-		error("ERROR: %s: Invalid file handle\n", __func__);
-		return -1;
-	}
-}
-*/
-
 
 int ipsw_file_seek(ipsw_file_handle_t handle, int64_t offset, int whence) {
     if (!handle) {
         fprintf(stderr, "ERROR: %s: Invalid file handle\n", __func__);
+        fflush(stderr);
         return -1;
     }
 
-    // 计算目标位置
+    int64_t current_pos = handle->zfile ? zip_ftell(handle->zfile) : (handle->file ? ftello(handle->file) : -1);
+    if (current_pos < 0) {
+        fprintf(stderr, "ERROR: Failed to get current position, errno: %s\n", strerror(errno));
+        fflush(stderr);
+        return -1;
+    }
+
     int64_t target_pos;
     if (whence == SEEK_SET) {
         target_pos = offset;
     } else if (whence == SEEK_CUR) {
-        if (handle->zfile) {
-            target_pos = zip_ftell(handle->zfile) + offset;
-        } else if (handle->file) {
-            target_pos = ftello(handle->file) + offset;
-        } else {
-            return -1;
-        }
+        target_pos = current_pos + offset;
     } else if (whence == SEEK_END) {
         target_pos = handle->size + offset;
     } else {
         fprintf(stderr, "ERROR: Invalid whence parameter\n");
+        fflush(stderr);
         return -1;
     }
 
-    // 检查边界
+    fprintf(stderr, "DEBUG: Seeking from 0x%llx to 0x%llx (whence = %d)\n",
+            (unsigned long long)current_pos, (unsigned long long)target_pos, whence);
+    fflush(stderr);
+
     if (target_pos < 0 || target_pos > handle->size) {
-        fprintf(stderr, "ERROR: Seek target 0x%" PRIx64 " is outside file bounds (0x%" PRIx64 ")\n", 
-                target_pos, handle->size);
+        fprintf(stderr, "ERROR: Seek target 0x%llx outside bounds (0x%llx)\n",
+                (unsigned long long)target_pos, (unsigned long long)handle->size);
+        fflush(stderr);
         return -1;
     }
 
-    // 加密文件处理
     if (handle->is_encrypted) {
-        // 对齐到AES块大小
         int64_t aligned_offset = (target_pos / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
         handle->_seek_block_index = target_pos - aligned_offset;
-        
+
         if (handle->zfile) {
-            // 重新打开文件
-            zip_fclose(handle->zfile);
-            
-            // 重新初始化解密上下文
-            const char* key = idevicerestore_get_decryption_key();
-            if (!key) {
-                fprintf(stderr, "ERROR: No decryption key available\n");
-                return -1;
-            }
-            
-            EVP_CIPHER_CTX_free(handle->aes_ctx);
-            handle->aes_ctx = EVP_CIPHER_CTX_new();
-            EVP_DecryptInit_ex(handle->aes_ctx, EVP_aes_128_cbc(), NULL, (unsigned char*)key, NULL);
-            
-            // 打开新的文件句柄
-            handle->zfile = zip_fopen_index_encrypted(handle->zip, handle->zindex, ZIP_FL_ENC_GUESS, key);
-            if (!handle->zfile) {
-                fprintf(stderr, "ERROR: Failed to reopen encrypted file\n");
-                return -1;
-            }
-            
-            // 跳过数据到对齐位置
-            if (aligned_offset > 0) {
-                char temp_buffer[8192];
-                int64_t remaining = aligned_offset;
-                while (remaining > 0) {
-                    size_t to_read = (remaining > sizeof(temp_buffer)) ? sizeof(temp_buffer) : remaining;
-                    int64_t read_bytes = zip_fread(handle->zfile, temp_buffer, to_read);
-                    if (read_bytes <= 0) {
-                        fprintf(stderr, "ERROR: Failed to skip to aligned position\n");
+            fprintf(stderr, "DEBUG: Seekable = %d, attempting direct seek to 0x%llx\n",
+                    handle->seekable, (unsigned long long)aligned_offset);
+            fflush(stderr);
+
+            if (current_pos != aligned_offset) {
+                if (zip_fseek(handle->zfile, aligned_offset, SEEK_SET) == 0) {
+                    fprintf(stderr, "DEBUG: Direct zip_fseek to 0x%llx succeeded\n",
+                            (unsigned long long)aligned_offset);
+                    fflush(stderr);
+                    goto success;
+                }
+                fprintf(stderr, "WARNING: zip_fseek to 0x%llx failed, errno: %s, attempting fallback\n",
+                        (unsigned long long)aligned_offset, strerror(errno));
+                fflush(stderr);
+
+                int64_t to_skip = aligned_offset - current_pos;
+                fprintf(stderr, "DEBUG: Forcing read-and-skip from 0x%llx to 0x%llx\n",
+                        (unsigned long long)current_pos, (unsigned long long)aligned_offset);
+                fflush(stderr);
+
+                char temp_buffer[32768];
+                int64_t total_skipped = 0;
+                const int64_t log_interval = 1024 * 1024;
+
+                if (to_skip < 0) {
+                    if (zip_fseek(handle->zfile, 0, SEEK_SET) != 0) {
+                        fprintf(stderr, "ERROR: Failed to reset to 0x0, errno: %s\n", strerror(errno));
+                        fflush(stderr);
                         return -1;
                     }
-                    remaining -= read_bytes;
+                    current_pos = 0;
+                    to_skip = aligned_offset;
+                    fprintf(stderr, "DEBUG: Reset to 0x0, now skipping forward to 0x%llx\n",
+                            (unsigned long long)aligned_offset);
+                    fflush(stderr);
                 }
+
+                while (to_skip > 0) {
+                    size_t chunk = (to_skip > sizeof(temp_buffer)) ? sizeof(temp_buffer) : to_skip;
+                    ssize_t read_bytes = zip_fread(handle->zfile, temp_buffer, chunk);
+                    if (read_bytes <= 0) {
+                        fprintf(stderr, "ERROR: Failed to skip %zu bytes at 0x%llx, read returned %zd, errno: %s\n",
+                                chunk, (unsigned long long)(aligned_offset - to_skip), read_bytes, strerror(errno));
+                        fflush(stderr);
+                        return -1;
+                    }
+                    to_skip -= read_bytes;
+                    total_skipped += read_bytes;
+                    if (total_skipped % log_interval == 0 || to_skip == 0) {
+                        fprintf(stderr, "DEBUG: Skipped %lld bytes total, remaining to skip: 0x%llx\n",
+                                (long long)total_skipped, (unsigned long long)to_skip);
+                        fflush(stderr);
+                    }
+                }
+            } else {
+                fprintf(stderr, "DEBUG: No seek needed, already at 0x%llx\n",
+                        (unsigned long long)aligned_offset);
+                fflush(stderr);
             }
+success:
+            if (handle->cache && (aligned_offset < handle->cache->offset || 
+                                  aligned_offset >= handle->cache->offset + handle->cache->size)) {
+                handle->cache->size = 0; // Invalidate cache
+                fprintf(stderr, "DEBUG: Cache invalidated due to seek to 0x%llx\n",
+                        (unsigned long long)aligned_offset);
+                fflush(stderr);
+            }
+            fprintf(stderr, "DEBUG: Seeked to aligned offset 0x%llx, block_index = %lld\n",
+                    (unsigned long long)aligned_offset, (long long)handle->_seek_block_index);
+            fflush(stderr);
+            return 0;
         } else if (handle->file) {
-            // 对于普通文件，直接定位到对齐位置
             if (fseeko(handle->file, aligned_offset, SEEK_SET) != 0) {
-                fprintf(stderr, "ERROR: Failed to seek in file\n");
+                fprintf(stderr, "ERROR: fseeko to 0x%llx failed, errno: %s\n",
+                        (unsigned long long)aligned_offset, strerror(errno));
+                fflush(stderr);
                 return -1;
             }
+            return 0;
+        }
+    }
+
+    if (handle->zfile) {
+        if (zip_fseek(handle->zfile, target_pos, SEEK_SET) < 0) {
+            fprintf(stderr, "ERROR: zip_fseek to 0x%llx failed, errno: %s\n",
+                    (unsigned long long)target_pos, strerror(errno));
+            fflush(stderr);
+            return -1;
         }
         return 0;
-    }
-    
-    // 未加密文件处理
-    if (handle->zfile) {
-        return zip_fseek(handle->zfile, target_pos, SEEK_SET);
     } else if (handle->file) {
-        return fseeko(handle->file, target_pos, whence);
+        return fseeko(handle->file, target_pos, SEEK_SET);
     }
-    
+
     return -1;
 }
+
+int64_t ipsw_file_read(ipsw_file_handle_t handle, void* buffer, size_t size) 
+{
+    if (!handle) {
+        fprintf(stderr, "ERROR: %s: Invalid file handle\n", __func__);
+        fflush(stderr);
+        return -1;
+    }
+
+    uint64_t current_pos;
+    int is_zip = 0;
+    if (handle->zfile) {
+        current_pos = zip_ftell(handle->zfile);
+        is_zip = 1;
+    } else if (handle->file) {
+        current_pos = ftello(handle->file);
+    } else {
+        fprintf(stderr, "ERROR: %s: No valid file handle\n", __func__);
+        fflush(stderr);
+        return -1;
+    }
+
+    fprintf(stderr, "DEBUG: type = %s, encrypted = %d, size = 0x%llx, pos = 0x%llx, requested = %zu\n",
+            is_zip ? "zip" : "file", handle->is_encrypted, (unsigned long long)handle->size,
+            (unsigned long long)current_pos, size);
+    fflush(stderr);
+
+    if (current_pos >= handle->size) {
+        fprintf(stderr, "ERROR: Offset 0x%llx exceeds file size 0x%llx\n",
+                (unsigned long long)current_pos, (unsigned long long)handle->size);
+        fflush(stderr);
+        return 0;
+    }
+
+    uint64_t bytes_remaining = handle->size - current_pos;
+    size_t to_read = (size > bytes_remaining) ? bytes_remaining : size;
+    fprintf(stderr, "DEBUG: bytes_remaining = 0x%llx, to_read = %zu\n",
+            (unsigned long long)bytes_remaining, to_read);
+    fflush(stderr);
+
+    if (!handle->cache) {
+        handle->cache = create_seek_cache(1024 * 1024);
+        if (!handle->cache) {
+            fprintf(stderr, "ERROR: Failed to create cache\n");
+            fflush(stderr);
+            return -1;
+        }
+    }
+
+    if (handle->cache->size > 0 &&
+        current_pos >= handle->cache->offset &&
+        current_pos < handle->cache->offset + handle->cache->size) {
+        size_t cache_offset = current_pos - handle->cache->offset;
+        size_t available = handle->cache->size - cache_offset;
+        size_t to_copy = (to_read <= available) ? to_read : available;
+        
+        fprintf(stderr, "DEBUG: Reading %zu bytes from cache at offset 0x%llx\n",
+                to_copy, (unsigned long long)(handle->cache->offset + cache_offset));
+        fflush(stderr);
+        
+        memcpy(buffer, handle->cache->data + cache_offset, to_copy);
+        
+        if (to_copy == to_read) {
+            handle->last_read_pos = current_pos + to_copy;
+            return to_copy;
+        }
+        
+        buffer = (char*)buffer + to_copy;
+        to_read -= to_copy;
+        current_pos += to_copy;
+    }
+
+    if (handle->is_encrypted && is_zip) {
+        size_t cache_size = (to_read > handle->cache->capacity) ? handle->cache->capacity : to_read;
+        ssize_t bytes_read = zip_fread(handle->zfile, handle->cache->data, cache_size);
+        if (bytes_read < 0) {
+            fprintf(stderr, "ERROR: zip_fread at 0x%llx, size %zu failed, errno: %s\n",
+                    (unsigned long long)current_pos, cache_size, strerror(errno));
+            fflush(stderr);
+            return -1;
+        }
+
+        handle->cache->size = bytes_read;
+        handle->cache->offset = current_pos;
+        fprintf(stderr, "DEBUG: Cached %zd bytes at offset 0x%llx\n",
+                bytes_read, (unsigned long long)current_pos);
+        fflush(stderr);
+
+        size_t to_copy = (to_read <= (size_t)bytes_read) ? to_read : bytes_read;
+        memcpy(buffer, handle->cache->data, to_copy);
+        handle->last_read_pos = current_pos + to_copy;
+        fprintf(stderr, "DEBUG: Read %zu bytes directly from encrypted zip\n", to_copy);
+        fflush(stderr);
+        return to_copy;
+    }
+
+    if (is_zip) {
+        ssize_t bytes_read = zip_fread(handle->zfile, buffer, to_read);
+        if (bytes_read < 0) {
+            fprintf(stderr, "ERROR: zip_fread at 0x%llx, size %zu failed, errno: %s\n",
+                    (unsigned long long)current_pos, to_read, strerror(errno));
+            fflush(stderr);
+            return -1;
+        }
+        handle->last_read_pos = current_pos + bytes_read;
+        fprintf(stderr, "DEBUG: Read %zd bytes from non-encrypted zip\n", bytes_read);
+        fflush(stderr);
+        return bytes_read;
+    } else {
+        size_t bytes_read = fread(buffer, 1, to_read, handle->file);
+        if (ferror(handle->file)) {
+            fprintf(stderr, "ERROR: fread at 0x%llx, size %zu failed, errno: %s\n",
+                    (unsigned long long)current_pos, to_read, strerror(errno));
+            fflush(stderr);
+            return -1;
+        }
+        handle->last_read_pos = current_pos + bytes_read;
+        fprintf(stderr, "DEBUG: Read %zu bytes from file\n", bytes_read);
+        fflush(stderr);
+        return bytes_read;
+    }
+
+    return -1;
+}
+
+
+
+
 
 
 int64_t ipsw_file_tell(ipsw_file_handle_t handle)
