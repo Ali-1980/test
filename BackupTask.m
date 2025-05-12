@@ -52,7 +52,7 @@ typedef NS_ENUM(NSInteger, MFCLogLevel) {
 };
 
 typedef struct {
-    int isValid;
+    BOOL isValid;
     int64_t lastSuccess;
     int failureCount;
     int nextInterval;
@@ -180,7 +180,7 @@ typedef struct BackupContext {
         
         // 初始化SSL状态
         _sslState = (SSLConnectionState){
-            .isValid = 1,
+            .isValid = YES,              // 使用YES代替1
             .lastSuccess = 0,
             .failureCount = 0,
             .nextInterval = MIN_HEARTBEAT_INTERVAL
@@ -194,9 +194,9 @@ typedef struct BackupContext {
 // 添加SSL状态安全访问方法
 - (BOOL)isSSLValid {
     [self.sslStateLock lock];
-    BOOL valid;
+    BOOL valid = NO;
     @try {
-        valid = _sslState.isValid != 0;
+        valid = _sslState.isValid;
     } @finally {
         [self.sslStateLock unlock];
     }
@@ -206,7 +206,7 @@ typedef struct BackupContext {
 - (void)setSSLValid:(BOOL)valid {
     [self.sslStateLock lock];
     @try {
-        _sslState.isValid = valid ? 1 : 0;
+        _sslState.isValid = valid;
     } @finally {
         [self.sslStateLock unlock];
     }
@@ -223,7 +223,7 @@ typedef struct BackupContext {
 
 - (int)sslFailureCount {
     [self.sslStateLock lock];
-    int count;
+    int count = 0;
     @try {
         count = _sslState.failureCount;
     } @finally {
@@ -237,11 +237,17 @@ typedef struct BackupContext {
     
     [self.sslStateLock lock];
     @try {
-        updateBlock(&_sslState);
+        // 创建临时状态
+        SSLConnectionState tempState = _sslState;
+        // 在临时状态上执行更新
+        updateBlock(&tempState);
+        // 原子性地更新真实状态
+        _sslState = tempState;
     } @finally {
         [self.sslStateLock unlock];
     }
 }
+
 
 - (void)dealloc {
     [self logInfo:@"BackupTask对象销毁，执行清理"];
@@ -3999,6 +4005,117 @@ typedef struct BackupContext {
     return (lerr == LOCKDOWN_E_SUCCESS);
 }
 
+
+// 6. 添加心跳超时保护
+- (void)handleHeartbeatWithTimeout:(NSTimeInterval)timeout completion:(void (^)(BOOL success, NSError *error))completion {
+    dispatch_async(self.sslQueue, ^{
+        __block BOOL success = NO;
+        __block NSError *error = nil;
+        
+        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+        dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.sslQueue);
+        
+        dispatch_source_set_timer(timer,
+                                dispatch_time(DISPATCH_TIME_NOW, timeout * NSEC_PER_SEC),
+                                DISPATCH_TIME_FOREVER, 0);
+        
+        dispatch_source_set_event_handler(timer, ^{
+            dispatch_semaphore_signal(semaphore);
+        });
+        
+        dispatch_resume(timer);
+        
+        // 执行心跳检查
+        @try {
+            if (![self performHeartbeatCheck:&error]) {
+                success = NO;
+            } else {
+                success = YES;
+                [self updateSSLState:^(SSLConnectionState *state) {
+                    state->isValid = YES;
+                    state->lastSuccess = time(NULL);
+                    state->failureCount = 0;
+                }];
+            }
+        } @catch (NSException *exception) {
+            error = [self createError:MFCToolBackupErrorSSL
+                         description:[NSString stringWithFormat:@"心跳处理异常: %@", exception.reason]];
+            success = NO;
+        }
+        
+        // 取消定时器
+        dispatch_source_cancel(timer);
+        dispatch_release(timer);
+        
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(success, error);
+            });
+        }
+    });
+}
+
+// 7. 添加心跳检查的核心方法
+- (BOOL)performHeartbeatCheck:(NSError **)error {
+    if (![self isSSLValid]) {
+        [self incrementSSLFailureCount];
+        if ([self sslFailureCount] > MAX_SSL_RETRIES) {
+            if (error) {
+                *error = [self createError:MFCToolBackupErrorSSL
+                             description:@"SSL连接状态无效，需要重新建立连接"];
+            }
+            return NO;
+        }
+    }
+    
+    __block BOOL success = NO;
+    __block NSError *localError = nil;
+    
+    @try {
+        // 创建心跳消息
+        plist_t ping = plist_new_dict();
+        if (!ping) {
+            if (error) {
+                *error = [self createError:MFCToolBackupErrorInternal
+                             description:@"无法创建心跳消息"];
+            }
+            return NO;
+        }
+        
+        @try {
+            // 添加心跳消息内容
+            plist_dict_set_item(ping, "MessageName", plist_new_string("DLMessagePing"));
+            plist_dict_set_item(ping, "Timestamp",
+                              plist_new_string([[@(time(NULL)) stringValue] UTF8String]));
+            
+            // 发送心跳消息
+            mobilebackup2_error_t mb2_err = mobilebackup2_send_message(_backupContext->backup,
+                                                                    "DLMessagePing",
+                                                                    ping);
+            
+            if (mb2_err == MOBILEBACKUP2_E_SUCCESS) {
+                success = YES;
+            } else {
+                if (error) {
+                    *error = [self createError:MFCToolBackupErrorCommunication
+                                 description:[NSString stringWithFormat:@"心跳发送失败，错误码: %d", mb2_err]];
+                }
+            }
+        } @finally {
+            if (ping) {
+                plist_free(ping);
+            }
+        }
+    } @catch (NSException *exception) {
+        if (error) {
+            *error = [self createError:MFCToolBackupErrorInternal
+                         description:[NSString stringWithFormat:@"心跳检查异常: %@", exception.reason]];
+        }
+        success = NO;
+    }
+    
+    return success;
+}
 
 // 添加SSL会话恢复方法
 - (BOOL)recoverSSLSession {
