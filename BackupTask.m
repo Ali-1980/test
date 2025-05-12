@@ -885,7 +885,6 @@ typedef struct BackupContext {
     [self logInfo:@"初始化服务"];
     [self updateProgress:0.03 message:@"初始化服务..."];
     
-    // 使用连接队列保证线程安全
     __block BOOL success = NO;
     __block NSError *localError = nil;
     
@@ -911,49 +910,72 @@ typedef struct BackupContext {
         
         [self logDebug:@"AFC服务启动成功"];
         
-        // 启动MobileBackup2服务
-        [self logDebug:@"启动MobileBackup2服务"];
-        lockdownd_service_descriptor_t backup_service = NULL;
-        lerr = lockdownd_start_service(_backupContext->lockdown,
-                                     "com.apple.mobilebackup2",
-                                     &backup_service);
-        
-        if (lerr != LOCKDOWN_E_SUCCESS || !backup_service) {
-            [self logError:@"MobileBackup2服务启动失败，错误代码: %d", lerr];
-            localError = [self createError:MFCToolBackupErrorService
-                              description:[NSString stringWithFormat:@"MobileBackup2服务启动失败，错误代码: %d", lerr]];
-            success = NO;
-            return;
+        // 添加SSL会话预热
+        [self logDebug:@"预热SSL会话"];
+        if (![self warmupSSLSession]) {
+            [self logWarning:@"SSL会话预热失败，继续尝试服务启动"];
         }
         
-        // 创建MobileBackup2客户端
-        mobilebackup2_error_t mb2_err = mobilebackup2_client_new(_backupContext->device,
-                                                              backup_service,
-                                                              &_backupContext->backup);
+        // 启动MobileBackup2服务（添加重试机制）
+        int retryCount = 0;
+        const int maxRetries = 3;
+        mobilebackup2_error_t mb2_err = MOBILEBACKUP2_E_SSL_ERROR;
         
-        lockdownd_service_descriptor_free(backup_service);
-        
-        if (mb2_err == MOBILEBACKUP2_E_SSL_ERROR) {
-            [self logError:@"MobileBackup2 SSL连接失败，开始重试流程"];
+        while (retryCount < maxRetries) {
+            [self logDebug:@"启动MobileBackup2服务 (尝试 %d/%d)", retryCount + 1, maxRetries];
             
-            // 记录SSL错误详情
-            [self logSSLError:mb2_err];
+            lockdownd_service_descriptor_t backup_service = NULL;
+            lerr = lockdownd_start_service(_backupContext->lockdown,
+                                         "com.apple.mobilebackup2",
+                                         &backup_service);
             
-            // 尝试重新建立SSL连接
-            mb2_err = [self retrySSLConnection:backup_service];
+            if (lerr != LOCKDOWN_E_SUCCESS || !backup_service) {
+                [self logError:@"MobileBackup2服务启动失败，错误代码: %d", lerr];
+                retryCount++;
+                if (retryCount < maxRetries) {
+                    [NSThread sleepForTimeInterval:2.0];
+                    continue;
+                }
+                localError = [self createError:MFCToolBackupErrorService
+                                  description:@"无法启动备份服务，请重新连接设备"];
+                success = NO;
+                return;
+            }
+            
+            // 创建MobileBackup2客户端
+            mb2_err = mobilebackup2_client_new(_backupContext->device,
+                                             backup_service,
+                                             &_backupContext->backup);
+            
+            lockdownd_service_descriptor_free(backup_service);
             
             if (mb2_err == MOBILEBACKUP2_E_SSL_ERROR) {
+                [self logError:@"SSL连接失败，尝试重新建立 (%d/%d)", retryCount + 1, maxRetries];
+                
+                // 记录SSL错误详情
+                [self logSSLErrorDetails:mb2_err];
+                
+                // 清理之前的连接
+                if (_backupContext->backup) {
+                    mobilebackup2_client_free(_backupContext->backup);
+                    _backupContext->backup = NULL;
+                }
+                
+                retryCount++;
+                if (retryCount < maxRetries) {
+                    // 重置SSL状态
+                    [self resetSSLState];
+                    [NSThread sleepForTimeInterval:2.0];
+                    continue;
+                }
+                
                 NSString *errorDescription = [NSString stringWithFormat:
                     @"无法建立安全连接，请检查：\n"
                     "1. 设备是否已解锁\n"
-                    "2. 是否已在设备上信任此电脑\n"
+                    "2. 是否信任此电脑\n"
                     "3. USB连接是否稳定\n"
-                    "如果问题持续，请尝试：\n"
-                    "1. 断开并重新连接设备\n"
-                    "2. 重启设备和电脑\n"
                     "错误代码: %d", mb2_err];
                 
-                // 显示详细的错误提示
                 dispatch_async(dispatch_get_main_queue(), ^{
                     NSAlert *alert = [[NSAlert alloc] init];
                     [alert setMessageText:@"安全连接失败"];
@@ -967,13 +989,21 @@ typedef struct BackupContext {
                                   description:errorDescription];
                 success = NO;
                 return;
+            } else if (mb2_err != MOBILEBACKUP2_E_SUCCESS) {
+                [self logError:@"MobileBackup2客户端创建失败，错误代码: %d", mb2_err];
+                retryCount++;
+                if (retryCount < maxRetries) {
+                    [NSThread sleepForTimeInterval:2.0];
+                    continue;
+                }
+                localError = [self createError:MFCToolBackupErrorService
+                                  description:[NSString stringWithFormat:@"MobileBackup2客户端创建失败，错误代码: %d", mb2_err]];
+                success = NO;
+                return;
             }
-        } else if (mb2_err != MOBILEBACKUP2_E_SUCCESS) {
-            [self logError:@"MobileBackup2客户端创建失败，错误代码: %d", mb2_err];
-            localError = [self createError:MFCToolBackupErrorService
-                              description:[NSString stringWithFormat:@"MobileBackup2客户端创建失败，错误代码: %d", mb2_err]];
-            success = NO;
-            return;
+            
+            // 如果成功，跳出重试循环
+            break;
         }
         
         [self logInfo:@"MobileBackup2服务已准备就绪"];
@@ -991,13 +1021,50 @@ typedef struct BackupContext {
     return success;
 }
 
-// 添加SSL错误处理相关的辅助方法
-- (void)logSSLError:(mobilebackup2_error_t)error {
-    [self logError:@"SSL错误详情:"];
+// 新增：SSL会话预热方法
+- (BOOL)warmupSSLSession {
+    if (!_backupContext || !_backupContext->device) {
+        return NO;
+    }
+    
+    // 执行一个简单的设备信息查询来预热SSL会话
+    char *deviceName = NULL;
+    lockdownd_error_t lerr = lockdownd_get_device_name(_backupContext->lockdown, &deviceName);
+    if (deviceName) {
+        free(deviceName);
+    }
+    
+    return (lerr == LOCKDOWN_E_SUCCESS);
+}
+
+// 新增：重置SSL状态方法
+- (void)resetSSLState {
+    if (_backupContext && _backupContext->backup) {
+        mobilebackup2_client_free(_backupContext->backup);
+        _backupContext->backup = NULL;
+    }
+    
+    // 重新初始化lockdown服务
+    if (_backupContext && _backupContext->lockdown) {
+        lockdownd_client_free(_backupContext->lockdown);
+        _backupContext->lockdown = NULL;
+        
+        lockdownd_error_t lerr = lockdownd_client_new_with_handshake(_backupContext->device,
+                                                                    &_backupContext->lockdown,
+                                                                    "MFCTOOL");
+        if (lerr != LOCKDOWN_E_SUCCESS) {
+            [self logError:@"重置SSL状态时重新创建lockdown失败: %d", lerr];
+        }
+    }
+}
+
+// 新增：详细的SSL错误日志方法
+- (void)logSSLErrorDetails:(mobilebackup2_error_t)error {
+    [self logError:@"SSL错误详细信息:"];
     [self logError:@"- 错误代码: %d", error];
     [self logError:@"- 发生时间: %@", [NSDate date]];
-    [self logError:@"- 设备UDID: %@", _backupContext->deviceUDID];
-    [self logError:@"- 最后通信时间: %@", self.lastMessageTime ?: @"无"];
+    [self logError:@"- 连接持续时间: %.2f秒",
+        [[NSDate date] timeIntervalSinceDate:_backupContext->startTime]];
 }
 
 - (mobilebackup2_error_t)retrySSLConnection:(lockdownd_service_descriptor_t)service {
