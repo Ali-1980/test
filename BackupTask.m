@@ -12,6 +12,7 @@
 #import <libimfccore/afc.h>
 #import <plist/plist.h>
 #import "DatalogsSettings.h"
+#import <stdatomic.h>
 
 // 错误域定义
 NSString *const MFCToolBackupErrorDomain = @"com.MFCTOOL.backup";
@@ -50,6 +51,13 @@ typedef NS_ENUM(NSInteger, MFCLogLevel) {
     MFCLogLevelVerbose = 4   // 显示详细调试信息
 };
 
+typedef struct {
+    int isValid;
+    int64_t lastSuccess;
+    int failureCount;
+    int nextInterval;
+} SSLConnectionState;
+
 #pragma mark - 备份上下文结构
 
 // 备份上下文结构
@@ -66,13 +74,6 @@ typedef struct BackupContext {
     NSString *backupPath;            // 备份路径
     double protocolVersion;          // 协议版本
 } BackupContext;
-
-typedef struct {
-    volatile atomic_bool isValid;
-    volatile atomic_int_fast64_t lastSuccess;
-    volatile atomic_int failureCount;
-    volatile atomic_int nextInterval;
-} SSLConnectionState;
 
 
 #pragma mark - 私有接口
@@ -120,13 +121,11 @@ typedef struct {
 @property (nonatomic, strong) NSDate *lastMessageTime;           // 上次消息时间
 @property (nonatomic, assign) BOOL isConnected;                  // 是否已连接
 
-// 修改属性声明，使用atomic修饰
-@property (atomic) SSLConnectionState sslState;
+// 添加新的SSL相关属性
+@property (nonatomic, assign) SSLConnectionState sslState;
 @property (nonatomic, strong) dispatch_queue_t sslQueue;
-
 // 添加用于同步的锁
 @property (nonatomic, strong) NSLock *sslStateLock;
-
 
 @end
 
@@ -179,8 +178,11 @@ typedef struct {
         
         // 初始化SSL相关
         _sslQueue = dispatch_queue_create("com.MFCTOOL.ssl", DISPATCH_QUEUE_SERIAL);
+        _sslStateLock = [[NSLock alloc] init];
+        
+        // 初始化SSL状态
         _sslState = (SSLConnectionState){
-            .isValid = YES,
+            .isValid = 1,
             .lastSuccess = 0,
             .failureCount = 0,
             .nextInterval = MIN_HEARTBEAT_INTERVAL
@@ -191,13 +193,56 @@ typedef struct {
     return self;
 }
 
-// 在实现文件中添加getter和setter方法
-- (SSLConnectionState)sslState {
-    return _sslState;
+// 添加SSL状态安全访问方法
+- (BOOL)isSSLValid {
+    [self.sslStateLock lock];
+    BOOL valid;
+    @try {
+        valid = _sslState.isValid != 0;
+    } @finally {
+        [self.sslStateLock unlock];
+    }
+    return valid;
 }
 
-- (void)setSslState:(SSLConnectionState)state {
-    _sslState = state;
+- (void)setSSLValid:(BOOL)valid {
+    [self.sslStateLock lock];
+    @try {
+        _sslState.isValid = valid ? 1 : 0;
+    } @finally {
+        [self.sslStateLock unlock];
+    }
+}
+
+- (void)incrementSSLFailureCount {
+    [self.sslStateLock lock];
+    @try {
+        _sslState.failureCount++;
+    } @finally {
+        [self.sslStateLock unlock];
+    }
+}
+
+- (int)sslFailureCount {
+    [self.sslStateLock lock];
+    int count;
+    @try {
+        count = _sslState.failureCount;
+    } @finally {
+        [self.sslStateLock unlock];
+    }
+    return count;
+}
+
+- (void)updateSSLState:(void (^)(SSLConnectionState *state))updateBlock {
+    if (!updateBlock) return;
+    
+    [self.sslStateLock lock];
+    @try {
+        updateBlock(&_sslState);
+    } @finally {
+        [self.sslStateLock unlock];
+    }
 }
 
 - (void)dealloc {
@@ -3825,24 +3870,16 @@ typedef struct {
     __block BOOL success = NO;
     __block NSError *localError = nil;
     
-    // 使用专门的SSL队列
     dispatch_sync(self.sslQueue, ^{
-        // 获取一个可修改的SSL状态副本
-        SSLConnectionState currentState = self.sslState;
-        
-        // 检查SSL状态
-        if (!currentState.isValid) {
-            currentState.failureCount++;
-            if (currentState.failureCount > MAX_SSL_RETRIES) {
+        if (![self isSSLValid]) {
+            [self incrementSSLFailureCount];
+            if ([self sslFailureCount] > MAX_SSL_RETRIES) {
                 localError = [self createError:MFCToolBackupErrorSSL
                                  description:@"SSL连接状态无效，需要重新建立连接"];
-                // 更新状态
-                self.sslState = currentState;
                 return;
             }
         }
         
-        // 创建心跳消息
         plist_t ping = plist_new_dict();
         if (!ping) {
             localError = [self createError:MFCToolBackupErrorInternal
@@ -3851,22 +3888,21 @@ typedef struct {
         }
         
         @try {
-            // 添加心跳数据
             plist_dict_set_item(ping, "MessageName", plist_new_string("DLMessagePing"));
             plist_dict_set_item(ping, "Timestamp",
                               plist_new_string([[@(time(NULL)) stringValue] UTF8String]));
             
-            // 发送心跳前检查连接
             if (![self verifyDeviceConnection]) {
                 localError = [self createError:MFCToolBackupErrorDeviceConnection
                                  description:@"设备连接已断开"];
                 return;
             }
             
-            // 设置超时保护
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
             dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
                                                           0, 0, self.sslQueue);
+            
+            __block BOOL timeoutOccurred = NO;
             
             if (timer) {
                 dispatch_source_set_timer(timer,
@@ -3874,19 +3910,18 @@ typedef struct {
                                         DISPATCH_TIME_FOREVER, 0);
                 
                 dispatch_source_set_event_handler(timer, ^{
+                    timeoutOccurred = YES;
                     dispatch_semaphore_signal(sem);
                 });
                 
                 dispatch_resume(timer);
             }
             
-            // 发送心跳
             mobilebackup2_error_t mb2_err = mobilebackup2_send_message(_backupContext->backup,
                                                                     "DLMessagePing",
                                                                     ping);
             
             if (mb2_err == MOBILEBACKUP2_E_SUCCESS) {
-                // 等待响应
                 char *dlmessage = NULL;
                 plist_t response = NULL;
                 
@@ -3896,13 +3931,12 @@ typedef struct {
                 
                 if (mb2_err == MOBILEBACKUP2_E_SUCCESS && dlmessage) {
                     if (strcmp(dlmessage, "DLMessageProcessMessage") == 0) {
-                        // 心跳成功
                         success = YES;
-                        // 更新SSL状态
-                        currentState.isValid = YES;
-                        currentState.lastSuccess = time(NULL);
-                        currentState.failureCount = 0;
-                        self.sslState = currentState;
+                        [self updateSSLState:^(SSLConnectionState *state) {
+                            state->isValid = 1;
+                            state->lastSuccess = time(NULL);
+                            state->failureCount = 0;
+                        }];
                     }
                     free(dlmessage);
                 }
@@ -3912,21 +3946,18 @@ typedef struct {
                 }
             }
             
-            // 取消超时定时器
             if (timer) {
                 dispatch_source_cancel(timer);
             }
             
-            // 检查心跳结果
             if (!success) {
-                if (mb2_err == MOBILEBACKUP2_E_SSL_ERROR) {
-                    // 更新SSL状态
-                    currentState.isValid = NO;
-                    self.sslState = currentState;
-                    
+                if (timeoutOccurred) {
+                    localError = [self createError:MFCToolBackupErrorTimeout
+                                     description:@"心跳请求超时"];
+                } else if (mb2_err == MOBILEBACKUP2_E_SSL_ERROR) {
+                    [self setSSLValid:NO];
                     [self logError:@"SSL心跳失败，错误码: %d", mb2_err];
                     
-                    // 尝试恢复SSL会话
                     if ([self recoverSSLSession]) {
                         success = YES;
                     } else {
@@ -3957,15 +3988,12 @@ typedef struct {
 }
 
 
-
-
-// 添加设备连接验证方法
+// 实现设备连接验证方法
 - (BOOL)verifyDeviceConnection {
     if (!_backupContext || !_backupContext->device || !_backupContext->lockdown) {
         return NO;
     }
     
-    // 获取设备名称作为基本连接测试
     char *deviceName = NULL;
     lockdownd_error_t lerr = lockdownd_get_device_name(_backupContext->lockdown, &deviceName);
     
@@ -3975,6 +4003,7 @@ typedef struct {
     
     return (lerr == LOCKDOWN_E_SUCCESS);
 }
+
 
 // 添加SSL会话恢复方法
 - (BOOL)recoverSSLSession {
