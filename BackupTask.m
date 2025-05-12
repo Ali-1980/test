@@ -1929,30 +1929,17 @@ typedef struct BackupContext {
         NSLog(@"[备份调试] 距上次心跳: %.1f 秒, 心跳间隔: %.1f 秒",
               timeSinceLastHeartbeat, heartbeatInterval);
                                              
-        if (timeSinceLastHeartbeat > heartbeatInterval) {
-            NSLog(@"[备份调试] 发送心跳信号");
-            if ([self sendHeartbeat]) {
-                lastHeartbeatTime = [NSDate date];
-                [self logDebug:@"发送心跳成功，间隔: %.1f秒", timeSinceLastHeartbeat];
-                NSLog(@"[备份调试] 心跳发送成功");
-            } else {
-                [self logWarning:@"心跳发送失败，检查连接状态"];
-                NSLog(@"[备份调试] 警告: 心跳发送失败");
-                
-                // 检查设备是否仍然连接
-                if (![self isDeviceStillConnected]) {
-                    [self logError:@"心跳检测显示设备已断开连接"];
-                    NSLog(@"[备份调试] 错误: 设备已断开连接");
-                    if (error) {
-                        *error = [self createError:MFCToolBackupErrorDeviceConnection
-                                      description:@"设备已断开连接，请重新连接并确保设备已解锁"];
-                    }
-                    break;
+       
+        if (timeSinceLastHeartbeat >= heartbeatInterval) {
+            NSError *heartbeatError = nil;
+            if (![self handleHeartbeat:&heartbeatError]) {
+                [self logError:@"心跳检测失败: %@", heartbeatError.localizedDescription];
+                if (error) {
+                    *error = heartbeatError;
                 }
-                
-                // 如果心跳失败但设备仍然连接，缩短下次心跳时间间隔
-                lastHeartbeatTime = [NSDate dateWithTimeIntervalSinceNow:-heartbeatInterval/2];
+                return NO;
             }
+            lastHeartbeatTime = [NSDate date];
         }
         
         // 检查是否暂停
@@ -3728,6 +3715,117 @@ typedef struct BackupContext {
     });
     
     return success;
+}
+
+// 添加心跳处理方法
+- (BOOL)handleHeartbeat:(NSError **)error {
+    [self logDebug:@"执行心跳处理"];
+    
+    int retryCount = 0;
+    const int maxRetries = 3;
+    const NSTimeInterval retryDelay = 1.0;
+    
+    while (retryCount < maxRetries) {
+        // 创建心跳消息
+        plist_t ping = plist_new_dict();
+        plist_dict_set_item(ping, "MessageName", plist_new_string("DLMessagePing"));
+        
+        // 发送心跳
+        mobilebackup2_error_t mb2_err = mobilebackup2_send_message(_backupContext->backup,
+                                                                "DLMessagePing",
+                                                                ping);
+        plist_free(ping);
+        
+        if (mb2_err == MOBILEBACKUP2_E_SUCCESS) {
+            // 等待响应
+            char *dlmessage = NULL;
+            plist_t message = NULL;
+            mb2_err = mobilebackup2_receive_message(_backupContext->backup,
+                                                  &message,
+                                                  &dlmessage);
+            
+            if (mb2_err == MOBILEBACKUP2_E_SUCCESS) {
+                if (dlmessage && strcmp(dlmessage, "DLMessageProcessMessage") == 0) {
+                    free(dlmessage);
+                    plist_free(message);
+                    return YES;
+                }
+                free(dlmessage);
+                plist_free(message);
+            }
+        }
+        
+        // 处理SSL错误
+        if (mb2_err == MOBILEBACKUP2_E_SSL_ERROR) {
+            [self logError:@"心跳检测发生SSL错误，尝试恢复会话"];
+            if ([self recoverSSLSession]) {
+                [self logInfo:@"SSL会话恢复成功，重试心跳"];
+                retryCount++;
+                continue;
+            }
+        }
+        
+        retryCount++;
+        [NSThread sleepForTimeInterval:retryDelay];
+    }
+    
+    if (error) {
+        *error = [self createError:MFCToolBackupErrorSSL
+                      description:@"心跳检测失败，无法保持与设备的安全连接"];
+    }
+    return NO;
+}
+
+// 添加SSL会话恢复方法
+- (BOOL)recoverSSLSession {
+    [self logInfo:@"尝试恢复SSL会话"];
+    
+    // 保存当前备份客户端
+    mobilebackup2_client_t oldClient = _backupContext->backup;
+    
+    // 重新创建服务描述符
+    lockdownd_service_descriptor_t backup_service = NULL;
+    lockdownd_error_t lerr = lockdownd_start_service(_backupContext->lockdown,
+                                                    "com.apple.mobilebackup2",
+                                                    &backup_service);
+    
+    if (lerr != LOCKDOWN_E_SUCCESS || !backup_service) {
+        [self logError:@"无法重新启动备份服务"];
+        return NO;
+    }
+    
+    // 创建新的备份客户端
+    mobilebackup2_error_t mb2_err = mobilebackup2_client_new(_backupContext->device,
+                                                            backup_service,
+                                                            &_backupContext->backup);
+    
+    lockdownd_service_descriptor_free(backup_service);
+    
+    if (mb2_err != MOBILEBACKUP2_E_SUCCESS) {
+        _backupContext->backup = oldClient; // 恢复旧客户端
+        return NO;
+    }
+    
+    // 清理旧客户端
+    if (oldClient) {
+        mobilebackup2_client_free(oldClient);
+    }
+    
+    // 重新执行版本协商
+    double versions[] = {2.1, 2.0, 1.6};
+    double remote_version = 0.0;
+    mb2_err = mobilebackup2_version_exchange(_backupContext->backup,
+                                           versions,
+                                           sizeof(versions)/sizeof(versions[0]),
+                                           &remote_version);
+    
+    if (mb2_err != MOBILEBACKUP2_E_SUCCESS) {
+        [self logError:@"版本协商失败"];
+        return NO;
+    }
+    
+    [self logInfo:@"SSL会话恢复成功，新协议版本: %.1f", remote_version];
+    return YES;
 }
 
 
