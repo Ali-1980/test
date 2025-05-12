@@ -80,6 +80,7 @@ typedef struct BackupContext {
 
 @interface BackupTask () {
     BackupContext *_backupContext;   // 备份上下文
+    SSLConnectionState _sslState;    // SSL状态作为实例变量
 }
 
 // 并发控制
@@ -122,9 +123,7 @@ typedef struct BackupContext {
 @property (nonatomic, assign) BOOL isConnected;                  // 是否已连接
 
 // 添加新的SSL相关属性
-@property (nonatomic, assign) SSLConnectionState sslState;
 @property (nonatomic, strong) dispatch_queue_t sslQueue;
-// 添加用于同步的锁
 @property (nonatomic, strong) NSLock *sslStateLock;
 
 @end
