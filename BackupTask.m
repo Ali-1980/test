@@ -1,5 +1,6 @@
 //
 //  BackupTask.m
+//  MFCTOOL
 //
 //  Created by Monterey on 5/5/2025.
 //
@@ -129,7 +130,6 @@ typedef struct BackupContext {
 @end
 
 #pragma mark - 实现
-
 @implementation BackupTask
 
 #pragma mark - 单例方法
@@ -3897,11 +3897,10 @@ typedef struct BackupContext {
                 return;
             }
             
+            __block BOOL timeoutOccurred = NO;
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
             dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
                                                           0, 0, self.sslQueue);
-            
-            __block BOOL timeoutOccurred = NO;
             
             if (timer) {
                 dispatch_source_set_timer(timer,
@@ -3986,8 +3985,6 @@ typedef struct BackupContext {
     return success;
 }
 
-
-// 实现设备连接验证方法
 - (BOOL)verifyDeviceConnection {
     if (!_backupContext || !_backupContext->device || !_backupContext->lockdown) {
         return NO;
