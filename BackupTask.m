@@ -27,7 +27,7 @@ static void *kStateQueueSpecificValue = (void *)&kStateQueueSpecificValue;
 // 常量定义
 #define MAX_RETRY_COUNT 3
 #define MAX_TIMEOUT_SECONDS 15.0
-#define MAX_HEARTBEAT_INTERVAL 30.0
+
 #define MAX_SILENCE_DURATION 120.0
 #define MAX_PROCESS_DURATION 3600.0
 
@@ -35,6 +35,11 @@ static void *kStateQueueSpecificValue = (void *)&kStateQueueSpecificValue;
 #define HEARTBEAT_TIMEOUT 2.0           // 心跳超时时间为2秒
 #define MAX_HEARTBEAT_RETRIES 3         // 最大心跳重试次数
 #define HEARTBEAT_RECOVERY_DELAY 0.5    // 心跳恢复延迟
+
+#define SSL_RETRY_INTERVAL 0.5
+#define MAX_SSL_RETRIES 3
+#define MIN_HEARTBEAT_INTERVAL 1.0
+#define MAX_HEARTBEAT_INTERVAL 5.0
 
 // 日志级别
 typedef NS_ENUM(NSInteger, MFCLogLevel) {
@@ -61,6 +66,14 @@ typedef struct BackupContext {
     NSString *backupPath;            // 备份路径
     double protocolVersion;          // 协议版本
 } BackupContext;
+
+typedef struct {
+    volatile atomic_bool isValid;
+    volatile atomic_int_fast64_t lastSuccess;
+    volatile atomic_int failureCount;
+    volatile atomic_int nextInterval;
+} SSLConnectionState;
+
 
 #pragma mark - 私有接口
 
@@ -106,6 +119,14 @@ typedef struct BackupContext {
 // 跟踪信息
 @property (nonatomic, strong) NSDate *lastMessageTime;           // 上次消息时间
 @property (nonatomic, assign) BOOL isConnected;                  // 是否已连接
+
+// 修改属性声明，使用atomic修饰
+@property (atomic) SSLConnectionState sslState;
+@property (nonatomic, strong) dispatch_queue_t sslQueue;
+
+// 添加用于同步的锁
+@property (nonatomic, strong) NSLock *sslStateLock;
+
 
 @end
 
@@ -156,9 +177,27 @@ typedef struct BackupContext {
         // 初始化日志
         _logCollector = [NSMutableString string];
         
+        // 初始化SSL相关
+        _sslQueue = dispatch_queue_create("com.MFCTOOL.ssl", DISPATCH_QUEUE_SERIAL);
+        _sslState = (SSLConnectionState){
+            .isValid = YES,
+            .lastSuccess = 0,
+            .failureCount = 0,
+            .nextInterval = MIN_HEARTBEAT_INTERVAL
+        };
+        
         [self logInfo:@"BackupTask初始化完成"];
     }
     return self;
+}
+
+// 在实现文件中添加getter和setter方法
+- (SSLConnectionState)sslState {
+    return _sslState;
+}
+
+- (void)setSslState:(SSLConnectionState)state {
+    _sslState = state;
 }
 
 - (void)dealloc {
@@ -3783,127 +3822,142 @@ typedef struct BackupContext {
 
 // 修改心跳处理方法
 - (BOOL)handleHeartbeat:(NSError **)error {
-    [self logDebug:@"执行心跳处理"];
+    __block BOOL success = NO;
+    __block NSError *localError = nil;
     
-    int retryCount = 0;
-    BOOL heartbeatSuccess = NO;
-    
-    while (retryCount < MAX_HEARTBEAT_RETRIES && !heartbeatSuccess) {
-        @autoreleasepool {
-            // 创建心跳消息
-            plist_t ping = plist_new_dict();
+    // 使用专门的SSL队列
+    dispatch_sync(self.sslQueue, ^{
+        // 获取一个可修改的SSL状态副本
+        SSLConnectionState currentState = self.sslState;
+        
+        // 检查SSL状态
+        if (!currentState.isValid) {
+            currentState.failureCount++;
+            if (currentState.failureCount > MAX_SSL_RETRIES) {
+                localError = [self createError:MFCToolBackupErrorSSL
+                                 description:@"SSL连接状态无效，需要重新建立连接"];
+                // 更新状态
+                self.sslState = currentState;
+                return;
+            }
+        }
+        
+        // 创建心跳消息
+        plist_t ping = plist_new_dict();
+        if (!ping) {
+            localError = [self createError:MFCToolBackupErrorInternal
+                             description:@"无法创建心跳消息"];
+            return;
+        }
+        
+        @try {
+            // 添加心跳数据
             plist_dict_set_item(ping, "MessageName", plist_new_string("DLMessagePing"));
+            plist_dict_set_item(ping, "Timestamp",
+                              plist_new_string([[@(time(NULL)) stringValue] UTF8String]));
             
-            // 添加时间戳
-            NSString *timestamp = [NSString stringWithFormat:@"%.0f", [[NSDate date] timeIntervalSince1970]];
-            plist_dict_set_item(ping, "Timestamp", plist_new_string([timestamp UTF8String]));
-            
-            // 发送心跳前检查设备状态
+            // 发送心跳前检查连接
             if (![self verifyDeviceConnection]) {
-                [self logError:@"设备连接状态异常，中止心跳"];
-                if (error) {
-                    *error = [self createError:MFCToolBackupErrorDeviceConnection
-                                  description:@"设备连接已断开或状态异常"];
-                }
-                plist_free(ping);
-                return NO;
+                localError = [self createError:MFCToolBackupErrorDeviceConnection
+                                 description:@"设备连接已断开"];
+                return;
             }
             
-            // 使用dispatch_group确保心跳收发的同步性
-            dispatch_group_t group = dispatch_group_create();
-            dispatch_group_enter(group);
+            // 设置超时保护
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
+                                                          0, 0, self.sslQueue);
             
-            __block mobilebackup2_error_t mb2_err = MOBILEBACKUP2_E_SUCCESS;
-            __block BOOL receivedResponse = NO;
-            
-            dispatch_queue_t heartbeatQueue = dispatch_queue_create("com.backup.heartbeat", DISPATCH_QUEUE_SERIAL);
-            dispatch_async(heartbeatQueue, ^{
-                // 发送心跳
-                mb2_err = mobilebackup2_send_message(_backupContext->backup, "DLMessagePing", ping);
+            if (timer) {
+                dispatch_source_set_timer(timer,
+                                        dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                                        DISPATCH_TIME_FOREVER, 0);
                 
-                if (mb2_err == MOBILEBACKUP2_E_SUCCESS) {
-                    // 设置心跳接收超时
-                    dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, HEARTBEAT_TIMEOUT * NSEC_PER_SEC);
-                    
-                    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, heartbeatQueue);
-                    dispatch_source_set_timer(timer, timeout, DISPATCH_TIME_FOREVER, 0);
-                    
-                    dispatch_source_set_event_handler(timer, ^{
-                        if (!receivedResponse) {
-                            mb2_err = MOBILEBACKUP2_E_RECEIVE_TIMEOUT;
-                            dispatch_group_leave(group);
-                        }
-                        dispatch_source_cancel(timer);
-                    });
-                    
-                    dispatch_resume(timer);
-                    
-                    // 等待响应
-                    char *dlmessage = NULL;
-                    plist_t response = NULL;
-                    mb2_err = mobilebackup2_receive_message(_backupContext->backup, &response, &dlmessage);
-                    
-                    if (mb2_err == MOBILEBACKUP2_E_SUCCESS && dlmessage) {
-                        if (strcmp(dlmessage, "DLMessageProcessMessage") == 0) {
-                            receivedResponse = YES;
-                        }
-                        free(dlmessage);
-                    }
-                    if (response) {
-                        plist_free(response);
-                    }
-                    
-                    if (receivedResponse) {
-                        dispatch_source_cancel(timer);
-                        dispatch_group_leave(group);
-                    }
-                } else {
-                    dispatch_group_leave(group);
-                }
-            });
+                dispatch_source_set_event_handler(timer, ^{
+                    dispatch_semaphore_signal(sem);
+                });
+                
+                dispatch_resume(timer);
+            }
             
-            // 等待心跳操作完成或超时
-            dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, HEARTBEAT_TIMEOUT * NSEC_PER_SEC));
+            // 发送心跳
+            mobilebackup2_error_t mb2_err = mobilebackup2_send_message(_backupContext->backup,
+                                                                    "DLMessagePing",
+                                                                    ping);
+            
+            if (mb2_err == MOBILEBACKUP2_E_SUCCESS) {
+                // 等待响应
+                char *dlmessage = NULL;
+                plist_t response = NULL;
+                
+                mb2_err = mobilebackup2_receive_message(_backupContext->backup,
+                                                      &response,
+                                                      &dlmessage);
+                
+                if (mb2_err == MOBILEBACKUP2_E_SUCCESS && dlmessage) {
+                    if (strcmp(dlmessage, "DLMessageProcessMessage") == 0) {
+                        // 心跳成功
+                        success = YES;
+                        // 更新SSL状态
+                        currentState.isValid = YES;
+                        currentState.lastSuccess = time(NULL);
+                        currentState.failureCount = 0;
+                        self.sslState = currentState;
+                    }
+                    free(dlmessage);
+                }
+                
+                if (response) {
+                    plist_free(response);
+                }
+            }
+            
+            // 取消超时定时器
+            if (timer) {
+                dispatch_source_cancel(timer);
+            }
             
             // 检查心跳结果
-            if (mb2_err == MOBILEBACKUP2_E_SUCCESS && receivedResponse) {
-                heartbeatSuccess = YES;
-                [self logDebug:@"心跳成功"];
-            } else {
-                retryCount++;
-                [self logWarning:@"心跳失败 (尝试 %d/%d), 错误码: %d",
-                    retryCount, MAX_HEARTBEAT_RETRIES, mb2_err];
-                
+            if (!success) {
                 if (mb2_err == MOBILEBACKUP2_E_SSL_ERROR) {
-                    [self logInfo:@"检测到SSL错误，尝试恢复SSL会话"];
+                    // 更新SSL状态
+                    currentState.isValid = NO;
+                    self.sslState = currentState;
+                    
+                    [self logError:@"SSL心跳失败，错误码: %d", mb2_err];
+                    
+                    // 尝试恢复SSL会话
                     if ([self recoverSSLSession]) {
-                        [self logInfo:@"SSL会话恢复成功"];
-                        [NSThread sleepForTimeInterval:HEARTBEAT_RECOVERY_DELAY];
-                        continue;
+                        success = YES;
+                    } else {
+                        localError = [self createError:MFCToolBackupErrorSSL
+                                         description:@"无法恢复SSL会话"];
                     }
-                }
-                
-                // 短暂延迟后重试
-                if (retryCount < MAX_HEARTBEAT_RETRIES) {
-                    [NSThread sleepForTimeInterval:HEARTBEAT_RECOVERY_DELAY];
+                } else {
+                    localError = [self createError:MFCToolBackupErrorCommunication
+                                     description:[NSString stringWithFormat:@"心跳失败，错误码: %d", mb2_err]];
                 }
             }
-            
-            plist_free(ping);
+        } @catch (NSException *exception) {
+            [self logError:@"心跳处理异常: %@", exception];
+            localError = [self createError:MFCToolBackupErrorInternal
+                             description:[NSString stringWithFormat:@"心跳处理异常: %@", exception.reason]];
+        } @finally {
+            if (ping) {
+                plist_free(ping);
+            }
         }
+    });
+    
+    if (error && localError) {
+        *error = localError;
     }
     
-    if (!heartbeatSuccess) {
-        [self logError:@"心跳检测最终失败，已重试%d次", retryCount];
-        if (error) {
-            *error = [self createError:MFCToolBackupErrorCommunication
-                          description:@"无法维持与设备的稳定连接，请检查USB连接或重新配对设备"];
-        }
-        return NO;
-    }
-    
-    return YES;
+    return success;
 }
+
+
+
 
 // 添加设备连接验证方法
 - (BOOL)verifyDeviceConnection {
@@ -3924,23 +3978,26 @@ typedef struct BackupContext {
 
 // 添加SSL会话恢复方法
 - (BOOL)recoverSSLSession {
-    [self logInfo:@"尝试恢复SSL会话"];
+    [self logInfo:@"开始恢复SSL会话"];
     
-    // 保存当前备份客户端
-    mobilebackup2_client_t oldClient = _backupContext->backup;
+    // 清理现有连接
+    if (_backupContext->backup) {
+        mobilebackup2_client_free(_backupContext->backup);
+        _backupContext->backup = NULL;
+    }
     
-    // 重新创建服务描述符
+    // 重新启动服务
     lockdownd_service_descriptor_t backup_service = NULL;
     lockdownd_error_t lerr = lockdownd_start_service(_backupContext->lockdown,
                                                     "com.apple.mobilebackup2",
                                                     &backup_service);
     
     if (lerr != LOCKDOWN_E_SUCCESS || !backup_service) {
-        [self logError:@"无法重新启动备份服务"];
+        [self logError:@"重新启动备份服务失败"];
         return NO;
     }
     
-    // 创建新的备份客户端
+    // 创建新的客户端
     mobilebackup2_error_t mb2_err = mobilebackup2_client_new(_backupContext->device,
                                                             backup_service,
                                                             &_backupContext->backup);
@@ -3948,16 +4005,11 @@ typedef struct BackupContext {
     lockdownd_service_descriptor_free(backup_service);
     
     if (mb2_err != MOBILEBACKUP2_E_SUCCESS) {
-        _backupContext->backup = oldClient; // 恢复旧客户端
+        [self logError:@"创建新的备份客户端失败"];
         return NO;
     }
     
-    // 清理旧客户端
-    if (oldClient) {
-        mobilebackup2_client_free(oldClient);
-    }
-    
-    // 重新执行版本协商
+    // 执行版本协商
     double versions[] = {2.1, 2.0, 1.6};
     double remote_version = 0.0;
     mb2_err = mobilebackup2_version_exchange(_backupContext->backup,
@@ -3970,10 +4022,9 @@ typedef struct BackupContext {
         return NO;
     }
     
-    [self logInfo:@"SSL会话恢复成功，新协议版本: %.1f", remote_version];
+    [self logInfo:@"SSL会话恢复成功，远程版本: %.1f", remote_version];
     return YES;
 }
-
 
 #pragma mark - 状态和进度管理
 
