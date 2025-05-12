@@ -12,7 +12,6 @@
 #import <libimfccore/afc.h>
 #import <plist/plist.h>
 #import "DatalogsSettings.h"
-#import <stdatomic.h>
 
 // 错误域定义
 NSString *const MFCToolBackupErrorDomain = @"com.MFCTOOL.backup";
@@ -28,19 +27,9 @@ static void *kStateQueueSpecificValue = (void *)&kStateQueueSpecificValue;
 // 常量定义
 #define MAX_RETRY_COUNT 3
 #define MAX_TIMEOUT_SECONDS 15.0
-
+#define MAX_HEARTBEAT_INTERVAL 30.0
 #define MAX_SILENCE_DURATION 120.0
 #define MAX_PROCESS_DURATION 3600.0
-
-#define HEARTBEAT_INTERVAL 1.0          // 降低心跳间隔为1秒
-#define HEARTBEAT_TIMEOUT 2.0           // 心跳超时时间为2秒
-#define MAX_HEARTBEAT_RETRIES 3         // 最大心跳重试次数
-#define HEARTBEAT_RECOVERY_DELAY 0.5    // 心跳恢复延迟
-
-#define SSL_RETRY_INTERVAL 0.5
-#define MAX_SSL_RETRIES 3
-#define MIN_HEARTBEAT_INTERVAL 1.0
-#define MAX_HEARTBEAT_INTERVAL 5.0
 
 // 日志级别
 typedef NS_ENUM(NSInteger, MFCLogLevel) {
@@ -50,13 +39,6 @@ typedef NS_ENUM(NSInteger, MFCLogLevel) {
     MFCLogLevelDebug = 3,    // 显示调试信息、信息、警告和错误
     MFCLogLevelVerbose = 4   // 显示详细调试信息
 };
-
-typedef struct {
-    BOOL isValid;
-    int64_t lastSuccess;
-    int failureCount;
-    int nextInterval;
-} SSLConnectionState;
 
 #pragma mark - 备份上下文结构
 
@@ -75,12 +57,10 @@ typedef struct BackupContext {
     double protocolVersion;          // 协议版本
 } BackupContext;
 
-
 #pragma mark - 私有接口
 
 @interface BackupTask () {
     BackupContext *_backupContext;   // 备份上下文
-    SSLConnectionState _sslState;    // SSL状态作为实例变量
 }
 
 // 并发控制
@@ -122,14 +102,10 @@ typedef struct BackupContext {
 @property (nonatomic, strong) NSDate *lastMessageTime;           // 上次消息时间
 @property (nonatomic, assign) BOOL isConnected;                  // 是否已连接
 
-// 添加新的SSL相关属性
-@property (nonatomic, strong) dispatch_queue_t sslQueue;
-@property (nonatomic, strong) NSLock *sslStateLock;
-@property (nonatomic, strong) dispatch_source_t heartbeatTimer;  // 心跳定时器
-
 @end
 
 #pragma mark - 实现
+
 @implementation BackupTask
 
 #pragma mark - 单例方法
@@ -175,80 +151,10 @@ typedef struct BackupContext {
         // 初始化日志
         _logCollector = [NSMutableString string];
         
-        // 初始化SSL相关
-        _sslQueue = dispatch_queue_create("com.MFCTOOL.ssl", DISPATCH_QUEUE_SERIAL);
-        _sslStateLock = [[NSLock alloc] init];
-        
-        // 初始化SSL状态
-        _sslState = (SSLConnectionState){
-            .isValid = YES,              // 使用YES代替1
-            .lastSuccess = 0,
-            .failureCount = 0,
-            .nextInterval = MIN_HEARTBEAT_INTERVAL
-        };
-        
         [self logInfo:@"BackupTask初始化完成"];
     }
     return self;
 }
-
-// 添加SSL状态安全访问方法
-- (BOOL)isSSLValid {
-    [self.sslStateLock lock];
-    BOOL valid = NO;
-    @try {
-        valid = _sslState.isValid;
-    } @finally {
-        [self.sslStateLock unlock];
-    }
-    return valid;
-}
-
-- (void)setSSLValid:(BOOL)valid {
-    [self.sslStateLock lock];
-    @try {
-        _sslState.isValid = valid;
-    } @finally {
-        [self.sslStateLock unlock];
-    }
-}
-
-- (void)incrementSSLFailureCount {
-    [self.sslStateLock lock];
-    @try {
-        _sslState.failureCount++;
-    } @finally {
-        [self.sslStateLock unlock];
-    }
-}
-
-- (int)sslFailureCount {
-    [self.sslStateLock lock];
-    int count = 0;
-    @try {
-        count = _sslState.failureCount;
-    } @finally {
-        [self.sslStateLock unlock];
-    }
-    return count;
-}
-
-- (void)updateSSLState:(void (^)(SSLConnectionState *state))updateBlock {
-    if (!updateBlock) return;
-    
-    [self.sslStateLock lock];
-    @try {
-        // 创建临时状态
-        SSLConnectionState tempState = _sslState;
-        // 在临时状态上执行更新
-        updateBlock(&tempState);
-        // 原子性地更新真实状态
-        _sslState = tempState;
-    } @finally {
-        [self.sslStateLock unlock];
-    }
-}
-
 
 - (void)dealloc {
     [self logInfo:@"BackupTask对象销毁，执行清理"];
@@ -979,6 +885,7 @@ typedef struct BackupContext {
     [self logInfo:@"初始化服务"];
     [self updateProgress:0.03 message:@"初始化服务..."];
     
+    // 使用连接队列保证线程安全
     __block BOOL success = NO;
     __block NSError *localError = nil;
     
@@ -1004,100 +911,34 @@ typedef struct BackupContext {
         
         [self logDebug:@"AFC服务启动成功"];
         
-        // 添加SSL会话预热
-        [self logDebug:@"预热SSL会话"];
-        if (![self warmupSSLSession]) {
-            [self logWarning:@"SSL会话预热失败，继续尝试服务启动"];
+        // 启动MobileBackup2服务
+        [self logDebug:@"启动MobileBackup2服务"];
+        lockdownd_service_descriptor_t backup_service = NULL;
+        lerr = lockdownd_start_service(_backupContext->lockdown,
+                                     "com.apple.mobilebackup2",
+                                     &backup_service);
+        
+        if (lerr != LOCKDOWN_E_SUCCESS || !backup_service) {
+            [self logError:@"MobileBackup2服务启动失败，错误代码: %d", lerr];
+            localError = [self createError:MFCToolBackupErrorService
+                              description:[NSString stringWithFormat:@"MobileBackup2服务启动失败，错误代码: %d", lerr]];
+            success = NO;
+            return;
         }
         
-        // 启动MobileBackup2服务（添加重试机制）
-        int retryCount = 0;
-        const int maxRetries = 3;
-        mobilebackup2_error_t mb2_err = MOBILEBACKUP2_E_SSL_ERROR;
+        // 创建MobileBackup2客户端
+        mobilebackup2_error_t mb2_err = mobilebackup2_client_new(_backupContext->device,
+                                                              backup_service,
+                                                              &_backupContext->backup);
         
-        while (retryCount < maxRetries) {
-            [self logDebug:@"启动MobileBackup2服务 (尝试 %d/%d)", retryCount + 1, maxRetries];
-            
-            lockdownd_service_descriptor_t backup_service = NULL;
-            lerr = lockdownd_start_service(_backupContext->lockdown,
-                                         "com.apple.mobilebackup2",
-                                         &backup_service);
-            
-            if (lerr != LOCKDOWN_E_SUCCESS || !backup_service) {
-                [self logError:@"MobileBackup2服务启动失败，错误代码: %d", lerr];
-                retryCount++;
-                if (retryCount < maxRetries) {
-                    [NSThread sleepForTimeInterval:2.0];
-                    continue;
-                }
-                localError = [self createError:MFCToolBackupErrorService
-                                  description:@"无法启动备份服务，请重新连接设备"];
-                success = NO;
-                return;
-            }
-            
-            // 创建MobileBackup2客户端
-            mb2_err = mobilebackup2_client_new(_backupContext->device,
-                                             backup_service,
-                                             &_backupContext->backup);
-            
-            lockdownd_service_descriptor_free(backup_service);
-            
-            if (mb2_err == MOBILEBACKUP2_E_SSL_ERROR) {
-                [self logError:@"SSL连接失败，尝试重新建立 (%d/%d)", retryCount + 1, maxRetries];
-                
-                // 记录SSL错误详情
-                [self logSSLErrorDetails:mb2_err];
-                
-                // 清理之前的连接
-                if (_backupContext->backup) {
-                    mobilebackup2_client_free(_backupContext->backup);
-                    _backupContext->backup = NULL;
-                }
-                
-                retryCount++;
-                if (retryCount < maxRetries) {
-                    // 重置SSL状态
-                    [self resetSSLState];
-                    [NSThread sleepForTimeInterval:2.0];
-                    continue;
-                }
-                
-                NSString *errorDescription = [NSString stringWithFormat:
-                    @"无法建立安全连接，请检查：\n"
-                    "1. 设备是否已解锁\n"
-                    "2. 是否信任此电脑\n"
-                    "3. USB连接是否稳定\n"
-                    "错误代码: %d", mb2_err];
-                
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    NSAlert *alert = [[NSAlert alloc] init];
-                    [alert setMessageText:@"安全连接失败"];
-                    [alert setInformativeText:errorDescription];
-                    [alert addButtonWithTitle:@"确定"];
-                    [alert setAlertStyle:NSAlertStyleCritical];
-                    [alert runModal];
-                });
-                
-                localError = [self createError:MFCToolBackupErrorSSL
-                                  description:errorDescription];
-                success = NO;
-                return;
-            } else if (mb2_err != MOBILEBACKUP2_E_SUCCESS) {
-                [self logError:@"MobileBackup2客户端创建失败，错误代码: %d", mb2_err];
-                retryCount++;
-                if (retryCount < maxRetries) {
-                    [NSThread sleepForTimeInterval:2.0];
-                    continue;
-                }
-                localError = [self createError:MFCToolBackupErrorService
-                                  description:[NSString stringWithFormat:@"MobileBackup2客户端创建失败，错误代码: %d", mb2_err]];
-                success = NO;
-                return;
-            }
-            
-            // 如果成功，跳出重试循环
-            break;
+        lockdownd_service_descriptor_free(backup_service);
+        
+        if (mb2_err != MOBILEBACKUP2_E_SUCCESS) {
+            [self logError:@"MobileBackup2客户端创建失败，错误代码: %d", mb2_err];
+            localError = [self createError:MFCToolBackupErrorService
+                              description:[NSString stringWithFormat:@"MobileBackup2客户端创建失败，错误代码: %d", mb2_err]];
+            success = NO;
+            return;
         }
         
         [self logInfo:@"MobileBackup2服务已准备就绪"];
@@ -1113,96 +954,6 @@ typedef struct BackupContext {
     }
     
     return success;
-}
-
-// 新增：SSL会话预热方法
-- (BOOL)warmupSSLSession {
-    if (!_backupContext || !_backupContext->device) {
-        return NO;
-    }
-    
-    // 执行一个简单的设备信息查询来预热SSL会话
-    char *deviceName = NULL;
-    lockdownd_error_t lerr = lockdownd_get_device_name(_backupContext->lockdown, &deviceName);
-    if (deviceName) {
-        free(deviceName);
-    }
-    
-    return (lerr == LOCKDOWN_E_SUCCESS);
-}
-
-// 新增：重置SSL状态方法
-- (void)resetSSLState {
-    if (_backupContext && _backupContext->backup) {
-        mobilebackup2_client_free(_backupContext->backup);
-        _backupContext->backup = NULL;
-    }
-    
-    // 重新初始化lockdown服务
-    if (_backupContext && _backupContext->lockdown) {
-        lockdownd_client_free(_backupContext->lockdown);
-        _backupContext->lockdown = NULL;
-        
-        lockdownd_error_t lerr = lockdownd_client_new_with_handshake(_backupContext->device,
-                                                                    &_backupContext->lockdown,
-                                                                    "MFCTOOL");
-        if (lerr != LOCKDOWN_E_SUCCESS) {
-            [self logError:@"重置SSL状态时重新创建lockdown失败: %d", lerr];
-        }
-    }
-}
-
-// 新增：详细的SSL错误日志方法
-- (void)logSSLErrorDetails:(mobilebackup2_error_t)error {
-    [self logError:@"SSL错误详细信息:"];
-    [self logError:@"- 错误代码: %d", error];
-    [self logError:@"- 发生时间: %@", [NSDate date]];
-    [self logError:@"- 连接持续时间: %.2f秒",
-        [[NSDate date] timeIntervalSinceDate:_backupContext->startTime]];
-}
-
-- (mobilebackup2_error_t)retrySSLConnection:(lockdownd_service_descriptor_t)service {
-    int retryCount = 0;
-    const int maxRetries = 3;
-    const int retryDelay = 2; // 秒
-    mobilebackup2_error_t lastError = MOBILEBACKUP2_E_SSL_ERROR;
-    
-    while (retryCount < maxRetries) {
-        [self logInfo:@"尝试重新建立SSL连接 (%d/%d)", retryCount + 1, maxRetries];
-        
-        // 检查是否已取消
-        if ([self shouldCancel]) {
-            [self logInfo:@"SSL重连过程被取消"];
-            return MOBILEBACKUP2_E_SSL_ERROR;
-        }
-        
-        // 先清理之前的连接
-        if (_backupContext->backup) {
-            mobilebackup2_client_free(_backupContext->backup);
-            _backupContext->backup = NULL;
-        }
-        
-        // 等待后重试
-        [NSThread sleepForTimeInterval:retryDelay];
-        
-        // 重新创建客户端
-        lastError = mobilebackup2_client_new(_backupContext->device,
-                                           service,
-                                           &_backupContext->backup);
-        
-        if (lastError == MOBILEBACKUP2_E_SUCCESS) {
-            [self logInfo:@"SSL连接重试成功"];
-            return MOBILEBACKUP2_E_SUCCESS;
-        }
-        
-        [self logError:@"SSL连接重试失败 (%d/%d)，错误代码: %d",
-         retryCount + 1, maxRetries, lastError];
-        
-        retryCount++;
-    }
-    
-    [self logError:@"SSL连接重试次数已达上限"];
-    return lastError;
 }
 
 - (BOOL)performBackup:(NSError **)error {
@@ -1246,10 +997,8 @@ typedef struct BackupContext {
     return YES;
 }
 
-// 协商方法
 - (BOOL)performProtocolVersionExchange:(NSError **)error {
     [self logInfo:@"执行协议版本协商"];
-    NSLog(@"[备份调试] 开始协议版本协商过程");
     [self transitionToState:BackupStateNegotiating];
     
     __block BOOL success = NO;
@@ -1259,31 +1008,25 @@ typedef struct BackupContext {
     dispatch_sync(self.connectionQueue, ^{
         if (!_backupContext || !_backupContext->backup) {
             [self logError:@"备份上下文或MobileBackup2客户端为空"];
-            NSLog(@"[备份调试] 错误: 备份上下文或客户端为空");
             localError = [self createError:MFCToolBackupErrorInternal
                               description:@"备份上下文或MobileBackup2客户端为空"];
             success = NO;
             return;
         }
         
-        // 设置正确的版本数组 - 确保与libimobiledevice一致
-        NSLog(@"[备份调试] 准备版本数组: {2.1, 2.0, 1.6}");
+        [self logDebug:@"本地支持的协议版本: 2.1, 2.0, 1.6"];
         double versions[] = {2.1, 2.0, 1.6};
         char count = 3;
         double remote_version = 0.0;
         
         // 执行版本协商
-        NSLog(@"[备份调试] 调用mobilebackup2_version_exchange");
         mobilebackup2_error_t mb2_err = mobilebackup2_version_exchange(_backupContext->backup,
                                                                      versions,
                                                                      count,
                                                                      &remote_version);
         
-        NSLog(@"[备份调试] 版本交换返回代码: %d", mb2_err);
-        
         if (mb2_err != MOBILEBACKUP2_E_SUCCESS) {
             [self logError:@"协议版本协商失败，错误代码: %d", mb2_err];
-            NSLog(@"[备份调试] 协议版本协商失败: %d", mb2_err);
             localError = [self createError:MFCToolBackupErrorProtocol
                               description:[NSString stringWithFormat:@"协议版本协商失败，错误代码: %d", mb2_err]];
             success = NO;
@@ -1292,7 +1035,6 @@ typedef struct BackupContext {
         
         _backupContext->protocolVersion = remote_version;
         [self logInfo:@"协议版本协商成功，远程版本: %.1f", remote_version];
-        NSLog(@"[备份调试] 协议版本协商成功，远程版本: %.1f", remote_version);
         success = YES;
     });
     
@@ -1640,10 +1382,8 @@ typedef struct BackupContext {
     return NO;
 }
 
-// 备份请求发送方法
 - (BOOL)sendBackupRequest:(NSError **)error {
     [self logInfo:@"发送备份请求"];
-    NSLog(@"[备份调试] 开始发送备份请求");
     [self updateProgress:0.1 message:@"开始备份..."];
     
     __block BOOL success = NO;
@@ -1652,7 +1392,6 @@ typedef struct BackupContext {
     dispatch_sync(self.connectionQueue, ^{
         if (!_backupContext || !_backupContext->backup) {
             [self logError:@"备份上下文或客户端为空"];
-            NSLog(@"[备份调试] 错误: 备份上下文或客户端为空");
             localError = [self createError:MFCToolBackupErrorInternal
                               description:@"备份上下文或客户端为空"];
             success = NO;
@@ -1660,69 +1399,52 @@ typedef struct BackupContext {
         }
         
         // 创建备份选项
-        NSLog(@"[备份调试] 创建备份选项字典");
         plist_t options = plist_new_dict();
         
-        // 获取设备UDID
-        NSString *udid = _backupContext->deviceUDID;
-        NSLog(@"[备份调试] 设备UDID: %@", udid);
-        
         // 基本选项
-        plist_dict_set_item(options, "TargetIdentifier", plist_new_string([udid UTF8String]));
+        plist_dict_set_item(options, "TargetIdentifier", plist_new_string([_backupContext->deviceUDID UTF8String]));
         
         // 判断是否应该使用增量备份
         BOOL useIncrementalBackup = [self shouldUseIncrementalBackup];
-        NSLog(@"[备份调试] 使用增量备份: %@", useIncrementalBackup ? @"是" : @"否");
-        
         plist_dict_set_item(options, "FullBackup", plist_new_bool(useIncrementalBackup ? 0 : 1));
         plist_dict_set_item(options, "IncrementalBackup", plist_new_bool(useIncrementalBackup ? 1 : 0));
         [self logInfo:@"备份类型: %@", useIncrementalBackup ? @"增量备份" : @"完全备份"];
         
         // 设置备份路径
-        NSLog(@"[备份调试] 备份路径: %@", _backupContext->backupPath);
         plist_dict_set_item(options, "BackupComputerBase", plist_new_string([_backupContext->backupPath UTF8String]));
         
         // 加密选项
         if (_backupContext->isEncrypted) {
-            NSLog(@"[备份调试] 设置加密选项");
             // 明确设置加密标志
             plist_dict_set_item(options, "WillEncrypt", plist_new_bool(1));
             
             // 如果有密码，添加密码
             if (_backupContext->password) {
                 plist_dict_set_item(options, "Password", plist_new_string([_backupContext->password UTF8String]));
-                NSLog(@"[备份调试] 添加加密密码到备份选项");
+                [self logDebug:@"添加加密密码到备份选项"];
             }
         } else {
-            NSLog(@"[备份调试] 未使用加密");
             // 明确设置不加密
             plist_dict_set_item(options, "WillEncrypt", plist_new_bool(0));
         }
         
+        // 添加高级选项
+        // 是否保留相机胶卷 (用于恢复，备份操作暂不使用)
+        // plist_dict_set_item(options, "RestorePreserveCameraRoll", plist_new_bool(1));
+        
         // 添加备份应用选项
         plist_dict_set_item(options, "BackupApplications", plist_new_bool(1));
         
-        // 设置备份协议版本 - 使用正确的版本格式
+        // 设置备份协议版本
         char version_str[32];
-        sprintf(version_str, "%.1f", _backupContext->protocolVersion);
-        NSLog(@"[备份调试] 使用协议版本: %s", version_str);
+        sprintf(version_str, "%d.%d", MBACKUP2_VERSION_INT1, MBACKUP2_VERSION_INT2);
         plist_dict_set_item(options, "Version", plist_new_string(version_str));
         
-        // 输出完整的选项字典以便调试
-        char *options_xml = NULL;
-        uint32_t options_len = 0;
-        plist_to_xml(options, &options_xml, &options_len);
-        if (options_xml) {
-            NSLog(@"[备份调试] 完整备份选项: %s", options_xml);
-            free(options_xml);
-        }
-        
         // 发送备份请求
-        NSLog(@"[备份调试] 调用mobilebackup2_send_request");
         mobilebackup2_error_t mb2_err = mobilebackup2_send_request(_backupContext->backup,
                                                                  "Backup",
-                                                                 [udid UTF8String],
-                                                                 [udid UTF8String],
+                                                                 [_backupContext->deviceUDID UTF8String],
+                                                                 [_backupContext->deviceUDID UTF8String],
                                                                  options);
         
         // 释放选项对象
@@ -1730,7 +1452,6 @@ typedef struct BackupContext {
         
         if (mb2_err != MOBILEBACKUP2_E_SUCCESS) {
             [self logError:@"发送备份请求失败，错误代码: %d", mb2_err];
-            NSLog(@"[备份调试] 发送备份请求失败，错误代码: %d", mb2_err);
             localError = [self createError:[self mapProtocolErrorToErrorCode:mb2_err]
                               description:[NSString stringWithFormat:@"发送备份请求失败，错误代码: %d", mb2_err]];
             success = NO;
@@ -1738,7 +1459,6 @@ typedef struct BackupContext {
         }
         
         [self logInfo:@"备份请求已发送"];
-        NSLog(@"[备份调试] 备份请求发送成功");
         success = YES;
     });
     
@@ -1926,7 +1646,6 @@ typedef struct BackupContext {
 
 - (BOOL)processBackupMessages:(NSError **)error {
     [self logInfo:@"开始处理备份消息..."];
-    NSLog(@"[备份调试] ====== 开始备份消息处理循环 ======");
     
     // 验证当前状态
     __block BOOL isValid = NO;
@@ -1937,7 +1656,6 @@ typedef struct BackupContext {
     
     if (!isValid) {
         [self logError:@"备份上下文或客户端为空"];
-        NSLog(@"[备份调试] 错误: 备份上下文或客户端为空");
         if (error) {
             *error = [self createError:MFCToolBackupErrorInternal
                           description:@"备份上下文或客户端为空"];
@@ -1956,12 +1674,12 @@ typedef struct BackupContext {
     self.lastMessageTime = [NSDate date];
     NSDate *lastHeartbeatTime = [NSDate date];
     
-    // 自适应超时设置
-    NSTimeInterval initialTimeout = 5.0;  // 初始超时5秒
+    // 自适应超时设置 - 使用更短的初始超时
+    NSTimeInterval initialTimeout = 3.0;  // 缩短初始超时为3秒
     NSTimeInterval currentTimeout = initialTimeout;
-    NSTimeInterval maxTimeout = 20.0;     // 最大超时20秒
-    NSTimeInterval minTimeout = 3.0;      // 最小超时3秒
-    NSTimeInterval timeoutMultiplier = 1.5;
+    NSTimeInterval maxTimeout = 15.0;     // 减少最大超时为15秒
+    NSTimeInterval minTimeout = 2.0;      // 设置最小超时2秒
+    NSTimeInterval timeoutMultiplier = 1.3; // 减小超时倍增因子
     
     // 统计数据
     int messageSequence = 0;
@@ -1980,19 +1698,15 @@ typedef struct BackupContext {
         [alert runModal];
     });
     
-    NSLog(@"[备份调试] 备份消息处理设置完成，开始主循环");
-    
     // 处理消息循环
     while (!backupCompleted && [self shouldContinue]) {
         messageSequence++;
         [self logDebug:@"消息循环迭代 #%d，已处理文件数：%d", messageSequence, self.filesProcessed];
-        NSLog(@"[备份调试] 消息循环迭代 #%d", messageSequence);
         
         // 检查总体超时
         NSTimeInterval elapsedTotal = [[NSDate date] timeIntervalSinceDate:processStartTime];
         if (elapsedTotal > MAX_PROCESS_DURATION) {
             [self logError:@"备份消息处理超时 (超过%d分钟)", (int)(MAX_PROCESS_DURATION/60)];
-            NSLog(@"[备份调试] 错误: 备份总时间超时 %.1f 秒", elapsedTotal);
             if (error) {
                 *error = [self createError:MFCToolBackupErrorTimeout
                               description:@"备份消息处理超时，设备可能已断开连接"];
@@ -2002,11 +1716,8 @@ typedef struct BackupContext {
         
         // 检查自上次通信以来的时间
         NSTimeInterval silenceDuration = [[NSDate date] timeIntervalSinceDate:self.lastMessageTime];
-        NSLog(@"[备份调试] 距上次消息时间: %.1f 秒", silenceDuration);
-        
         if (silenceDuration > MAX_SILENCE_DURATION) {
             [self logError:@"设备通信中断时间过长 (%.1f秒)，可能已断开连接", silenceDuration];
-            NSLog(@"[备份调试] 错误: 通信中断时间过长 %.1f 秒", silenceDuration);
             if (error) {
                 *error = [self createError:MFCToolBackupErrorDeviceConnection
                               description:@"设备通信中断时间过长，请检查连接状态"];
@@ -2014,35 +1725,30 @@ typedef struct BackupContext {
             break;
         }
         
-        // 发送心跳以维持连接 - 更加智能的心跳策略
+        // 发送心跳以维持连接 - 更频繁的心跳
         NSTimeInterval timeSinceLastHeartbeat = [[NSDate date] timeIntervalSinceDate:lastHeartbeatTime];
-        
-        // 根据通信沉默时间自动调整心跳频率
-        NSTimeInterval heartbeatInterval = MIN(10.0, MAX(2.0, silenceDuration * 0.2));
-        
-        NSLog(@"[备份调试] 距上次心跳: %.1f 秒, 心跳间隔: %.1f 秒",
-              timeSinceLastHeartbeat, heartbeatInterval);
+        // 根据通信沉默时间增加心跳频率
+        NSTimeInterval heartbeatInterval = MIN(15.0, MAX(3.0, silenceDuration * 0.3));
                                              
-       
-        if (timeSinceLastHeartbeat >= HEARTBEAT_INTERVAL) {
-            NSError *heartbeatError = nil;
-            if (![self handleHeartbeat:&heartbeatError]) {
-                [self logError:@"心跳检测失败: %@", heartbeatError.localizedDescription];
-                
-                // 尝试一次性恢复
-                [self logInfo:@"尝试恢复备份连接..."];
-                if ([self recoverBackupConnection]) {
-                    [self logInfo:@"备份连接恢复成功，继续处理"];
-                    lastHeartbeatTime = [NSDate date];
-                    continue;
+        if (timeSinceLastHeartbeat > heartbeatInterval) {
+            if ([self sendHeartbeat]) {
+                lastHeartbeatTime = [NSDate date];
+                [self logDebug:@"发送心跳成功，间隔: %.1f秒", timeSinceLastHeartbeat];
+            } else {
+                [self logWarning:@"心跳发送失败，检查连接状态"];
+                // 检查设备是否仍然连接
+                if (![self isDeviceStillConnected]) {
+                    [self logError:@"心跳检测显示设备已断开连接"];
+                    if (error) {
+                        *error = [self createError:MFCToolBackupErrorDeviceConnection
+                                      description:@"设备已断开连接，请重新连接并确保设备已解锁"];
+                    }
+                    break;
                 }
                 
-                if (error) {
-                    *error = heartbeatError;
-                }
-                return NO;
+                // 如果心跳失败但设备仍然连接，缩短下次心跳时间间隔
+                lastHeartbeatTime = [NSDate dateWithTimeIntervalSinceNow:-heartbeatInterval/2];
             }
-            lastHeartbeatTime = [NSDate date];
         }
         
         // 检查是否暂停
@@ -2058,44 +1764,38 @@ typedef struct BackupContext {
             dlmessage = NULL;
         }
         
-        // 接收消息 - 使用更健壮的接收策略
+        // 接收消息
         [self logDebug:@"等待接收消息，迭代 #%d，当前超时: %.1f秒", messageSequence, currentTimeout];
-        NSLog(@"[备份调试] 等待接收消息, 超时: %.1f 秒", currentTimeout);
         
         // 使用信号量控制超时
         dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
         __block mobilebackup2_error_t mb2_err = MOBILEBACKUP2_E_SUCCESS;
         __block BOOL messageReceived = NO;
-        __block BOOL wasWaitingCancelled = NO;
         
-        // 在后台线程执行接收操作，以便能够取消
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        // 启动异步接收操作
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(self.connectionQueue, ^{
             @autoreleasepool {
-                // 线程安全地访问备份客户端
+                // 线程安全地访问 backup 客户端
                 mobilebackup2_client_t backup = NULL;
                 
-                __weak typeof(self) weakSelf = self;
-                @synchronized(weakSelf) {
-                    __strong typeof(weakSelf) strongSelf = weakSelf;
-                    if (strongSelf && strongSelf->_backupContext && strongSelf->_backupContext->backup) {
-                        backup = strongSelf->_backupContext->backup;
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                if (strongSelf) {
+                    @synchronized(strongSelf) {
+                        if (strongSelf->_backupContext && strongSelf->_backupContext->backup) {
+                            backup = strongSelf->_backupContext->backup;
+                        }
                     }
                 }
                 
                 if (backup) {
-                    NSLog(@"[备份调试] 开始调用mobilebackup2_receive_message");
                     mb2_err = mobilebackup2_receive_message(backup, &message, &dlmessage);
-                    NSLog(@"[备份调试] mobilebackup2_receive_message返回: %d", mb2_err);
                     messageReceived = (mb2_err == MOBILEBACKUP2_E_SUCCESS && message != NULL);
                 } else {
-                    NSLog(@"[备份调试] 错误: 备份客户端无效");
                     mb2_err = MOBILEBACKUP2_E_BAD_VERSION;
                 }
                 
-                // 如果等待已被取消，则不要发送信号
-                if (!wasWaitingCancelled) {
-                    dispatch_semaphore_signal(semaphore);
-                }
+                dispatch_semaphore_signal(semaphore);
             }
         });
         
@@ -2105,18 +1805,13 @@ typedef struct BackupContext {
         
         // 处理超时情况
         if (timeoutResult != 0) {
-            wasWaitingCancelled = YES; // 标记等待已取消
-            
             [self logWarning:@"接收消息超时 (%.1f秒)，超时次数: %d/5", currentTimeout, ++timeoutCount];
-            NSLog(@"[备份调试] 接收消息超时, 次数: %d/5", timeoutCount);
             
             // 检查设备是否仍连接
             BOOL deviceStillConnected = [self isDeviceStillConnected];
-            NSLog(@"[备份调试] 设备连接状态检查: %@", deviceStillConnected ? @"已连接" : @"已断开");
             
             if (!deviceStillConnected) {
                 [self logError:@"设备已断开连接或已锁定，备份中断"];
-                NSLog(@"[备份调试] 错误: 设备已断开连接或已锁定");
                 if (error) {
                     *error = [self createError:MFCToolBackupErrorDeviceConnection
                                     description:@"设备已断开连接或已锁定，请重连设备并保持解锁状态"];
@@ -2124,9 +1819,8 @@ typedef struct BackupContext {
                 break;
             }
             
-            if (timeoutCount > 3) {  // 最多允许3次超时
+            if (timeoutCount > 3) {  // 减少超时次数阈值
                 [self logError:@"多次超时，备份超时终止"];
-                NSLog(@"[备份调试] 错误: 超时次数过多，备份终止");
                 if (error) {
                     *error = [self createError:MFCToolBackupErrorTimeout
                                     description:@"备份超时，请检查设备连接和USB电缆状态"];
@@ -2137,39 +1831,46 @@ typedef struct BackupContext {
             // 增加超时时间，但不超过最大值
             currentTimeout = MIN(currentTimeout * timeoutMultiplier, maxTimeout);
             [self logInfo:@"增加接收超时时间到 %.1f秒", currentTimeout];
-            NSLog(@"[备份调试] 增加超时时间到 %.1f 秒", currentTimeout);
             
-            // 如果已超时多次，尝试重建连接
-            if (timeoutCount >= 2) {
-                [self logInfo:@"多次超时，尝试重置备份连接"];
-                NSLog(@"[备份调试] 尝试重建备份连接");
+            // 立即重建连接，而不是等待多次超时
+            if (timeoutCount >= 1) {
+                [self logInfo:@"超时后尝试重置备份客户端连接"];
+                
+                // 提示用户保持设备连接和解锁状态
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSAlert *alert = [[NSAlert alloc] init];
+                    [alert setMessageText:@"备份通信中断"];
+                    [alert setInformativeText:@"备份过程中通信中断。请确保设备解锁并保持连接状态，系统将尝试恢复备份。"];
+                    [alert addButtonWithTitle:@"继续"];
+                    [alert runModal];
+                });
                 
                 if (![self recreateBackupConnection:error]) {
                     [self logError:@"重建备份连接失败: %@", (*error).localizedDescription];
-                    NSLog(@"[备份调试] 错误: 重建连接失败: %@", (*error).localizedDescription);
-                    break;
-                } else {
-                    [self logInfo:@"备份连接重建成功，重新开始备份过程"];
-                    NSLog(@"[备份调试] 连接重建成功，重新发送备份请求");
                     
+                    // 只给一次重试机会
+                    if (timeoutCount >= 2) {
+                        [self logError:@"达到最大重试次数，终止备份"];
+                        break;
+                    }
+                } else {
+                    [self logInfo:@"备份连接重建成功，继续备份过程"];
                     // 重置超时计数器
                     timeoutCount = 0;
+                    // 重置当前超时时间
                     currentTimeout = initialTimeout;
                     
-                    // 重建连接后重新执行协议协商和备份请求
-                    if (![self performProtocolVersionExchange:error] ||
-                        ![self sendBackupRequest:error]) {
-                        [self logError:@"重建连接后重新初始化备份失败: %@", (*error).localizedDescription];
-                        NSLog(@"[备份调试] 错误: 重新初始化备份失败");
+                    // 重建连接后立即发送新的备份请求
+                    if (![self sendBackupRequest:error]) {
+                        [self logError:@"重建连接后发送备份请求失败: %@", (*error).localizedDescription];
                         break;
                     }
                 }
             }
             
-            // 等待短暂时间后继续
-            NSTimeInterval waitTime = 0.5 * (timeoutCount + 1);
+            // 更短的等待时间
+            NSTimeInterval waitTime = MIN(0.5 * timeoutCount, 2.0);
             [self logInfo:@"等待%.1f秒后重试", waitTime];
-            NSLog(@"[备份调试] 等待 %.1f 秒后重试", waitTime);
             [NSThread sleepForTimeInterval:waitTime];
             continue;
         }
@@ -2177,17 +1878,13 @@ typedef struct BackupContext {
         // 处理接收错误
         if (mb2_err != MOBILEBACKUP2_E_SUCCESS) {
             [self logError:@"接收消息失败，错误代码: %d", mb2_err];
-            NSLog(@"[备份调试] 错误: 接收消息失败，代码: %d", mb2_err);
             
             // 特定处理SSL错误（可能是设备断开连接）
             if (mb2_err == MOBILEBACKUP2_E_SSL_ERROR) {
                 [self logError:@"SSL错误，可能是设备断开连接或连接重置"];
-                NSLog(@"[备份调试] SSL错误，检查设备连接状态");
                 
                 // 检查设备是否已锁定
                 BOOL isConnected = [self isDeviceStillConnected];
-                NSLog(@"[备份调试] 设备连接状态: %@", isConnected ? @"已连接" : @"已断开");
-                
                 if (!isConnected) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                         NSAlert *alert = [[NSAlert alloc] init];
@@ -2216,16 +1913,14 @@ typedef struct BackupContext {
             // 成功收到消息，重置超时计数和降低超时时间
             timeoutCount = 0;
             // 逐渐减少超时时间，但不低于最小值
-            currentTimeout = MAX(currentTimeout * 0.9, minTimeout);
+            currentTimeout = MAX(currentTimeout * 0.8, minTimeout);
             
             self.lastMessageTime = [NSDate date];
-            NSLog(@"[备份调试] 成功接收消息，重置超时时间: %.1f 秒", currentTimeout);
             
             // 确认设备仍然连接正常
             BOOL deviceConnected = [self isDeviceStillConnected];
             if (!deviceConnected && !backupCompleted) {
                 [self logError:@"设备已断开连接，备份中断"];
-                NSLog(@"[备份调试] 错误: 检测到设备已断开连接");
                 if (error) {
                     *error = [self createError:MFCToolBackupErrorDeviceConnection
                                   description:@"设备已断开连接，请重新连接并重试备份"];
@@ -2236,23 +1931,11 @@ typedef struct BackupContext {
             // 处理接收到的消息
             if (dlmessage) {
                 [self logInfo:@"收到消息类型: %s", dlmessage];
-                NSLog(@"[备份调试] 收到消息: %s", dlmessage);
                 
                 // 统计消息类型
                 NSString *msgType = [NSString stringWithUTF8String:dlmessage];
-                NSNumber *count = [messageStats objectForKey:msgType] ?: @0;
+                NSNumber *count = [messageStats objectForKey:msgType];
                 [messageStats setObject:@([count intValue] + 1) forKey:msgType];
-                
-                // 输出消息内容用于调试
-                if (self.logLevel >= MFCLogLevelVerbose) {
-                    char *message_xml = NULL;
-                    uint32_t xml_length = 0;
-                    plist_to_xml(message, &message_xml, &xml_length);
-                    if (message_xml) {
-                        NSLog(@"[备份调试-详细] 消息内容: %s", message_xml);
-                        free(message_xml);
-                    }
-                }
                 
                 // 根据消息类型处理
                 if (!strcmp(dlmessage, "DLContentsOfDirectory")) {
@@ -2268,42 +1951,33 @@ typedef struct BackupContext {
                 } else if (!strcmp(dlmessage, "DLMessageDownloadFiles")) {
                     [self handleDownloadFiles:message];
                 } else if (!strcmp(dlmessage, "DLMessageDisconnect")) {
-                    NSLog(@"[备份调试] 收到断开连接消息，处理备份完成状态");
                     backupCompleted = [self handleDisconnectMessage:message dlmessage:dlmessage uploadFileCount:uploadFileCount error:error];
-                    NSLog(@"[备份调试] 断开消息处理结果: %@", backupCompleted ? @"备份完成" : @"备份未完成");
                 } else {
                     [self handleOtherMessage:dlmessage message:message];
                 }
             } else {
                 [self logWarning:@"接收到空消息名称"];
-                NSLog(@"[备份调试] 警告: 接收到空消息名称");
             }
         } else {
             [self logWarning:@"消息接收失败，但无详细错误"];
-            NSLog(@"[备份调试] 警告: 消息接收失败，无详细错误");
         }
         
         // 定期提供进度摘要
-        if (messageSequence % 20 == 0) {  // 更频繁地报告状态
+        if (messageSequence % 30 == 0) {  // 更频繁地报告状态
             NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:processStartTime];
             [self logInfo:@"备份处理状态: 已处理 %d 条消息，耗时 %.1f 秒，文件: %d，目录: %d",
                       messageSequence, elapsed, self.filesProcessed, createDirCount];
-            NSLog(@"[备份调试] 处理进度: %d 条消息，%.1f 秒，%d 文件，%d 目录",
-                  messageSequence, elapsed, self.filesProcessed, createDirCount);
             
             // 报告消息类型统计
             [self logInfo:@"消息类型统计: %@", messageStats];
-            NSLog(@"[备份调试] 消息统计: %@", messageStats);
         }
         
         // 验证备份进度，如果长时间无文件进展，可能表示备份异常
-        if (messageSequence > 50 && self.filesProcessed == 0 && uploadFileCount == 0) {
+        if (messageSequence > 50 && self.filesProcessed == 0 && uploadFileCount == 0) {  // 减少消息阈值
             [self logWarning:@"已处理 %d 条消息但未接收任何文件，备份可能异常", messageSequence];
-            NSLog(@"[备份调试] 警告: %d 条消息但未接收文件，检查备份进度", messageSequence);
             
             if (messageSequence > 100) {  // 减少异常检测阈值
                 [self logError:@"备份可能卡住，未接收任何文件数据"];
-                NSLog(@"[备份调试] 错误: 备份可能卡住，未接收文件数据");
                 
                 // 提示用户设备状态
                 if (messageSequence % 50 == 0 && messageSequence < 200) {
@@ -2320,19 +1994,16 @@ typedef struct BackupContext {
                     });
                 }
                 
-                // 尝试重新协商
-                if (messageSequence > 150 && messageSequence % 50 == 0) {
+                // 更早尝试重新协商
+                if (messageSequence > 150 && messageSequence % 50 == 0) {  // 减少阈值
                     [self logInfo:@"尝试重新协商备份会话以恢复进度"];
-                    NSLog(@"[备份调试] 尝试重新协商备份会话");
                     if ([self renegotiateBackupSession:error]) {
                         [self logInfo:@"重新协商成功，继续备份"];
-                        NSLog(@"[备份调试] 重新协商成功，继续备份");
                     }
                 }
                 
-                // 超过一定次数后终止
-                if (messageSequence > 300) {
-                    NSLog(@"[备份调试] 错误: 消息数过多但未收到文件，终止备份");
+                // 减少中止阈值
+                if (messageSequence > 350) {  // 减少阈值
                     if (error) {
                         *error = [self createError:MFCToolBackupErrorInternal
                                         description:@"备份可能卡住，未接收任何文件数据"];
@@ -2340,11 +2011,6 @@ typedef struct BackupContext {
                     break;
                 }
             }
-        }
-        
-        // 定期检查内存使用
-        if (messageSequence % 100 == 0) {
-            [self checkMemoryUsage];
         }
     }
     
@@ -2354,18 +2020,13 @@ typedef struct BackupContext {
     
     NSTimeInterval totalTime = [[NSDate date] timeIntervalSinceDate:processStartTime];
     [self logInfo:@"消息处理循环结束，总处理消息数: %d，总耗时: %.1f 秒", messageSequence, totalTime];
-    NSLog(@"[备份调试] ====== 备份消息循环结束 ======");
-    NSLog(@"[备份调试] 总消息: %d, 耗时: %.1f 秒", messageSequence, totalTime);
-
-    NSLog(@"[备份调试] 最终消息统计: %@", messageStats);
+    [self logInfo:@"消息类型统计: %@", messageStats];
     
     // 检查备份是否有效 - 改进的增量备份检测
     BOOL isValidBackup = backupCompleted && ([self isIncrementalBackupCompleted] || self.filesProcessed > 0);
-    NSLog(@"[备份调试] 备份有效性检查: %@", isValidBackup ? @"有效" : @"无效");
     
     if (!isValidBackup && backupCompleted) {
         [self logWarning:@"备份完成但可能无效，检查备份目录"];
-        NSLog(@"[备份调试] 警告: 备份标记完成但可能无效");
         if (error && !*error) {
             *error = [self createError:MFCToolBackupErrorInternal
                              description:@"备份过程完成但结果可能无效，请检查"];
@@ -2375,69 +2036,8 @@ typedef struct BackupContext {
     return isValidBackup;
 }
 
-- (BOOL)recoverBackupConnection {
-    [self logInfo:@"开始恢复备份连接"];
-    
-    // 清理现有连接
-    if (_backupContext->backup) {
-        mobilebackup2_client_free(_backupContext->backup);
-        _backupContext->backup = NULL;
-    }
-    
-    // 重新启动服务
-    lockdownd_service_descriptor_t backup_service = NULL;
-    lockdownd_error_t lerr = lockdownd_start_service(_backupContext->lockdown,
-                                                    "com.apple.mobilebackup2",
-                                                    &backup_service);
-    
-    if (lerr != LOCKDOWN_E_SUCCESS || !backup_service) {
-        [self logError:@"无法重新启动备份服务"];
-        return NO;
-    }
-    
-    // 创建新的备份客户端
-    mobilebackup2_error_t mb2_err = mobilebackup2_client_new(_backupContext->device,
-                                                            backup_service,
-                                                            &_backupContext->backup);
-    
-    lockdownd_service_descriptor_free(backup_service);
-    
-    if (mb2_err != MOBILEBACKUP2_E_SUCCESS) {
-        [self logError:@"无法创建新的备份客户端"];
-        return NO;
-    }
-    
-    // 重新进行版本协商
-    double versions[] = {2.1, 2.0, 1.6};
-    double remote_version = 0.0;
-    mb2_err = mobilebackup2_version_exchange(_backupContext->backup,
-                                           versions,
-                                           sizeof(versions)/sizeof(versions[0]),
-                                           &remote_version);
-    
-    if (mb2_err != MOBILEBACKUP2_E_SUCCESS) {
-        [self logError:@"版本重新协商失败"];
-        return NO;
-    }
-    
-    [self logInfo:@"备份连接恢复完成，协议版本: %.1f", remote_version];
-    return YES;
-}
-
-//断开连接处理
-
 - (BOOL)handleDisconnectMessage:(plist_t)message dlmessage:(char *)dlmessage uploadFileCount:(int)uploadFileCount error:(NSError **)error {
     [self logInfo:@"接收到断开连接消息，分析备份状态"];
-    NSLog(@"[备份调试] 收到断开连接消息");
-    
-    // 输出完整消息内容用于调试
-    char *message_xml = NULL;
-    uint32_t xml_length = 0;
-    plist_to_xml(message, &message_xml, &xml_length);
-    if (message_xml) {
-        NSLog(@"[备份调试] 断开消息内容: %s", message_xml);
-        free(message_xml);
-    }
     
     // 检查备份状态
     BOOL isComplete = YES;
@@ -2450,13 +2050,11 @@ typedef struct BackupContext {
         
         if (statusStr) {
             [self logInfo:@"备份状态: %s", statusStr];
-            NSLog(@"[备份调试] 备份状态: %s", statusStr);
             
             // 检查状态是否为"Complete"
             if (strcmp(statusStr, "Complete") != 0) {
                 isComplete = NO;
                 [self logWarning:@"备份未完全完成，状态为: %s", statusStr];
-                NSLog(@"[备份调试] 警告: 备份未完成，状态: %s", statusStr);
                 
                 if (error) {
                     NSString *statusDesc = [NSString stringWithUTF8String:statusStr];
@@ -2477,7 +2075,6 @@ typedef struct BackupContext {
         
         if (errorStr) {
             [self logError:@"备份错误: %s", errorStr];
-            NSLog(@"[备份调试] 错误描述: %s", errorStr);
             isComplete = NO;
             
             if (error) {
@@ -2490,29 +2087,22 @@ typedef struct BackupContext {
         }
     }
     
-    // 检查备份文件信息
-    NSLog(@"[备份调试] 备份统计: 处理文件数 %d, 上传文件数 %d", self.filesProcessed, uploadFileCount);
-    
     // DLMessageDisconnect消息通常应该在成功传输文件后收到
     // 如果此时没有文件，设置一个标志让调用者知道
     if (self.filesProcessed == 0 && uploadFileCount == 0) {
         [self logWarning:@"收到断开连接消息，但未接收到任何文件数据"];
-        NSLog(@"[备份调试] 警告: 未接收到任何文件数据");
         
         // 检查是否是有效的增量备份
         if ([self isIncrementalBackupCompleted]) {
             [self logInfo:@"检测到有效的增量备份，无需传输新文件"];
-            NSLog(@"[备份调试] 确认为有效的增量备份");
             isComplete = YES;
         } else {
             [self logWarning:@"可能是无效备份或空备份"];
-            NSLog(@"[备份调试] 警告: 可能是无效备份");
             // 不自动将其视为失败，让上层调用者决定
         }
     }
     
-    // 发送最终确认响应 - 格式必须符合协议要求
-    NSLog(@"[备份调试] 发送断开响应，状态: %@", isComplete ? @"Complete" : @"Incomplete");
+    // 发送最终确认响应
     [self sendDisconnectResponse:message isComplete:isComplete];
     
     return isComplete;
@@ -2522,36 +2112,12 @@ typedef struct BackupContext {
 - (void)sendDisconnectResponse:(plist_t)message isComplete:(BOOL)isComplete {
     dispatch_sync(self.connectionQueue, ^{
         if (_backupContext && _backupContext->backup) {
-            // 创建标准断开响应格式
+            // 创建响应
             plist_t response = plist_new_dict();
             
             // 添加状态
             plist_dict_set_item(response, "Status",
-                             plist_new_string(isComplete ? "Complete" : "Incomplete"));
-            
-            // 添加日期
-            NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-            [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
-            NSString *dateStr = [formatter stringFromDate:[NSDate date]];
-            plist_dict_set_item(response, "Date", plist_new_string([dateStr UTF8String]));
-            
-            // 添加备份统计信息
-            plist_dict_set_item(response, "FilesProcessed", plist_new_uint(self.filesProcessed));
-            plist_dict_set_item(response, "TotalBytes", plist_new_uint(self.totalBytesReceived));
-            
-            NSLog(@"[备份调试] 断开响应详情: 状态=%@, 文件=%d, 字节=%lld",
-                  isComplete ? @"Complete" : @"Incomplete",
-                  self.filesProcessed,
-                  self.totalBytesReceived);
-            
-            // 输出响应XML用于调试
-            char *response_xml = NULL;
-            uint32_t xml_length = 0;
-            plist_to_xml(response, &response_xml, &xml_length);
-            if (response_xml) {
-                NSLog(@"[备份调试] 断开响应XML: %s", response_xml);
-                free(response_xml);
-            }
+                              plist_new_string(isComplete ? "Complete" : "Incomplete"));
             
             // 发送响应
             mobilebackup2_send_status_response(_backupContext->backup, 0, NULL, response);
@@ -2566,216 +2132,39 @@ typedef struct BackupContext {
 
 // 设备连接状态检查方法
 - (BOOL)isDeviceStillConnected {
-    NSLog(@"[备份调试] 检查设备连接状态");
     __block BOOL isConnected = NO;
-    __block BOOL isLocked = NO;  // 添加锁定状态跟踪
     
     dispatch_sync(self.connectionQueue, ^{
         if (!_backupContext || !_backupContext->device || !_backupContext->lockdown) {
             isConnected = NO;
-            NSLog(@"[备份调试] 设备连接检查: 上下文或句柄为空");
             return;
         }
         
-        // 第一步: 尝试获取设备名称以检查基本连接
+        // 尝试获取设备名称，这是一个轻量级操作来确认设备连接
         char *deviceName = NULL;
         lockdownd_error_t lerr = lockdownd_get_device_name(_backupContext->lockdown, &deviceName);
         
-        NSLog(@"[备份调试] 获取设备名称结果: %d", lerr);
-        
         if (lerr == LOCKDOWN_E_SUCCESS && deviceName) {
-            // 设备基本连接正常
             isConnected = YES;
-            NSLog(@"[备份调试] 设备基本连接正常，名称: %s", deviceName);
             free(deviceName);
-            deviceName = NULL;
-        } else if (lerr == LOCKDOWN_E_PASSWORD_PROTECTED) {
-            // 设备已连接但锁定
-            isConnected = YES;  // 设备仍然连接
-            isLocked = YES;     // 但处于锁定状态
-            NSLog(@"[备份调试] 设备已连接但锁定");
-            [self logWarning:@"设备已锁定，请解锁后继续"];
         } else {
-            // 处理其他错误情况
-            isConnected = NO;
-            NSString *errorDesc = @"未知错误";
-            
-            if (lerr == LOCKDOWN_E_MUX_ERROR) {
-                errorDesc = @"USB多路复用错误";
-            } else if (lerr == LOCKDOWN_E_INVALID_SERVICE) {
-                errorDesc = @"无效服务";
-            } else if (lerr == LOCKDOWN_E_SSL_ERROR) {
-                errorDesc = @"SSL连接错误";
-            } else if (lerr == LOCKDOWN_E_RECEIVE_TIMEOUT) {
-                errorDesc = @"接收超时";
-            } else if (lerr == LOCKDOWN_E_INVALID_CONF) {
-                errorDesc = @"无效配置";
-            }
-            
-            NSLog(@"[备份调试] 设备连接错误(%d): %@", lerr, errorDesc);
-            [self logWarning:@"设备连接错误: %@ (代码: %d)", errorDesc, lerr];
-            return;
-        }
-        
-        // 第二步: 如果基本连接正常但未确定锁定状态，进一步检查设备锁定状态
-        if (isConnected && !isLocked) {
-            plist_t lockState = NULL;
-            lerr = lockdownd_get_value(_backupContext->lockdown, "com.apple.mobile.lockdown", "DeviceLocked", &lockState);
-            
-            NSLog(@"[备份调试] 获取设备锁定状态结果: %d", lerr);
-            
-            if (lerr == LOCKDOWN_E_SUCCESS && lockState) {
-                if (plist_get_node_type(lockState) == PLIST_BOOLEAN) {
-                    uint8_t lockValue = 0;
-                    plist_get_bool_val(lockState, &lockValue);
-                    
-                    isLocked = (lockValue != 0);
-                    NSLog(@"[备份调试] 设备锁定状态: %@", isLocked ? @"已锁定" : @"未锁定");
-                    
-                    if (isLocked) {
-                        [self logWarning:@"设备已锁定，请解锁后继续备份"];
-                    }
-                }
-                plist_free(lockState);
-            } else if (lerr == LOCKDOWN_E_PASSWORD_PROTECTED) {
-                // 🔑核心修复: 再次确认密码保护错误为锁定信号
-                isLocked = YES;
-                NSLog(@"[备份调试] 检查锁定状态时确认设备已锁定 (LOCKDOWN_E_PASSWORD_PROTECTED)");
+            // 检查特定错误类型
+            if (lerr == LOCKDOWN_E_PASSWORD_PROTECTED) {
                 [self logWarning:@"设备已锁定，请解锁后继续"];
+                isConnected = NO;
+            } else if (lerr == LOCKDOWN_E_MUX_ERROR ||
+                       lerr == LOCKDOWN_E_INVALID_SERVICE ||
+                       lerr == LOCKDOWN_E_SSL_ERROR) {
+                [self logWarning:@"设备连接出错，可能已断开连接，错误代码: %d", lerr];
+                isConnected = NO;
             } else {
-                NSLog(@"[备份调试] 无法获取设备锁定状态: %d", lerr);
-                
-                // 🔑核心修复: 如果无法确定锁定状态，使用新方法进行检查
-                isLocked = [self isDeviceLocked];
-                NSLog(@"[备份调试] 通过辅助方法检测锁定状态: %@", isLocked ? @"已锁定" : @"未锁定");
-            }
-        }
-        
-        // 第三步: 尝试获取设备信息以进一步验证连接
-        if (isConnected) {
-            // 获取一些基本设备信息作为额外验证
-            plist_t deviceInfo = NULL;
-            lerr = lockdownd_get_value(_backupContext->lockdown, NULL, "ProductVersion", &deviceInfo);
-            
-            if (lerr == LOCKDOWN_E_SUCCESS && deviceInfo) {
-                char *version_str = NULL;
-                if (plist_get_node_type(deviceInfo) == PLIST_STRING) {
-                    plist_get_string_val(deviceInfo, &version_str);
-                    if (version_str) {
-                        NSLog(@"[备份调试] 设备iOS版本: %s", version_str);
-                        free(version_str);
-                    }
-                }
-                plist_free(deviceInfo);
-            } else {
-                NSLog(@"[备份调试] 获取设备版本信息失败: %d", lerr);
-                // 不改变连接状态，因为这只是额外验证
+                [self logWarning:@"设备连接检查失败，错误代码: %d", lerr];
+                isConnected = NO;
             }
         }
     });
     
-    // 如果设备已锁定，为了备份操作，我们将其视为未连接
-    if (isConnected && isLocked) {
-        NSLog(@"[备份调试] 设备已连接但已锁定，备份无法继续");
-        isConnected = NO;  // 备份需要设备解锁
-        
-        // 可以在这里添加UI提示代码，提醒用户解锁设备
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NSAlert *alert = [[NSAlert alloc] init];
-            [alert setMessageText:@"设备已锁定"];
-            [alert setInformativeText:@"请解锁iOS设备以继续备份操作。"];
-            [alert addButtonWithTitle:@"确定"];
-            // 修复：移除不兼容的Window参数，改用runModal
-            [alert runModal];
-        });
-    }
-    
-    NSLog(@"[备份调试] 设备连接最终状态: %@", isConnected ? @"已连接且可用" : @"未连接或已锁定");
     return isConnected;
-}
-
-// 新增: 专门用于检测设备是否锁定的方法
-- (BOOL)isDeviceLocked {
-    if (!_backupContext || !_backupContext->lockdown) {
-        [self logInfo:@"无法检查锁定状态：缺少lockdown上下文"];
-        return YES;  // 保守假设，无法检查则认为已锁定
-    }
-    
-    // 方法1: 直接获取DeviceLocked状态（最直接的方法）
-    plist_t lockState = NULL;
-    lockdownd_error_t lerr = lockdownd_get_value(_backupContext->lockdown,
-                                              "com.apple.mobile.lockdown",
-                                              "DeviceLocked",
-                                              &lockState);
-    
-    // 如果返回LOCKDOWN_E_PASSWORD_PROTECTED错误，则确认设备已锁定
-    if (lerr == LOCKDOWN_E_PASSWORD_PROTECTED) {
-        [self logInfo:@"设备已锁定 (检测到LOCKDOWN_E_PASSWORD_PROTECTED错误)"];
-        return YES;
-    }
-    
-    // 检查锁定状态值
-    if (lerr == LOCKDOWN_E_SUCCESS && lockState) {
-        uint8_t lockValue = 0;
-        plist_get_bool_val(lockState, &lockValue);
-        plist_free(lockState);
-        if (lockValue) {
-            [self logInfo:@"设备已锁定 (DeviceLocked=true)"];
-            return YES;
-        } else {
-            [self logInfo:@"设备未锁定 (DeviceLocked=false)"];
-            return NO;  // 如果明确获取到未锁定状态，可以直接返回
-        }
-    }
-    
-    // 方法2: 测试启动受限服务 (通常比检查多个保护值更可靠)
-    lockdownd_service_descriptor_t service = NULL;
-    lerr = lockdownd_start_service(_backupContext->lockdown,
-                                 "com.apple.mobile.diagnostics_relay",
-                                 &service);
-    
-    if (lerr == LOCKDOWN_E_PASSWORD_PROTECTED) {
-        [self logInfo:@"设备已锁定 (无法启动诊断服务)"];
-        return YES;
-    }
-    
-    if (service) {
-        lockdownd_service_descriptor_free(service);
-        [self logInfo:@"设备未锁定 (成功启动诊断服务)"];
-        return NO;  // 成功启动服务意味着设备未锁定
-    }
-    
-    // 方法3: 尝试获取受保护的值来判断锁定状态
-    const char* protectedValues[] = {
-        "ProductVersion",
-        "DeviceClass",
-        "UniqueDeviceID",
-        "SerialNumber"  // 添加一个额外的保护值
-    };
-    
-    int failedChecks = 0;
-    int totalChecks = sizeof(protectedValues) / sizeof(protectedValues[0]);
-    
-    for (int i = 0; i < totalChecks; i++) {
-        plist_t val = NULL;
-        lerr = lockdownd_get_value(_backupContext->lockdown, NULL, protectedValues[i], &val);
-        
-        if (lerr == LOCKDOWN_E_PASSWORD_PROTECTED) {
-            failedChecks++;
-        }
-        
-        if (val) plist_free(val);
-    }
-    
-    // 使用比例而非固定数量来判断
-    float failureRatio = (float)failedChecks / totalChecks;
-    if (failureRatio >= 0.5) {  // 如果50%以上检查失败，判定设备已锁定
-        [self logInfo:@"设备已锁定 (%.0f%%受保护值无法访问)", failureRatio * 100];
-        return YES;
-    }
-    
-    [self logInfo:@"设备可能未锁定 (所有检查都未确认锁定状态)"];
-    return NO;
 }
 
 // 内存使用检查方法
@@ -2901,71 +2290,39 @@ typedef struct BackupContext {
     });
 }
 
-//文件上传处理
-
 - (void)handleUploadFiles:(plist_t)message {
     NSDate *operationStart = [NSDate date];
     __block long long bytesReceived = 0;
-    uint32_t entryCount = 0; // 不需要__block，因为不在block中修改
-    __block int processedCount = 0;  // 添加__block修饰符
     
-    NSLog(@"[备份调试] 处理文件上传请求");
-    
-    // 获取文件条目数组
     plist_t entries = plist_dict_get_item(message, "Entries");
     if (entries && plist_get_node_type(entries) == PLIST_ARRAY) {
-        entryCount = plist_array_get_size(entries);
+        uint32_t entryCount = plist_array_get_size(entries);
         [self logDebug:@"文件条目数量: %u", entryCount];
-        NSLog(@"[备份调试] 文件条目数量: %u", entryCount);
         
         // 如果是第一批文件，更新totalFiles
         dispatch_sync(self.stateQueue, ^{
             if (self.totalFiles == 0) {
                 self.totalFiles = entryCount;
                 [self logInfo:@"设置总文件数: %d", self.totalFiles];
-                NSLog(@"[备份调试] 设置总文件数: %d", self.totalFiles);
             }
         });
         
-        // 处理每个文件条目
         for (uint32_t i = 0; i < entryCount && [self shouldContinue]; i++) {
             plist_t entry = plist_array_get_item(entries, i);
-            if (!entry) {
-                NSLog(@"[备份调试] 警告: 索引 %u 的条目为空", i);
-                continue;
-            }
+            if (!entry) continue;
             
             plist_t path = plist_dict_get_item(entry, "Path");
             plist_t data = plist_dict_get_item(entry, "Data");
-            plist_t size = plist_dict_get_item(entry, "Size"); // 检查大小信息
             
             char *pathStr = NULL;
             uint64_t dataSize = 0;
             char *dataBytes = NULL;
-            uint64_t declaredSize = 0;
             
-            // 获取文件路径
-            if (path) {
-                plist_get_string_val(path, &pathStr);
-            }
-            
-            // 获取文件大小声明（如果存在）
-            if (size && plist_get_node_type(size) == PLIST_UINT) {
-                plist_get_uint_val(size, &declaredSize);
-            }
-            
-            // 获取文件数据
+            if (path) plist_get_string_val(path, &pathStr);
             if (data && plist_get_node_type(data) == PLIST_DATA) {
                 plist_get_data_val(data, &dataBytes, &dataSize);
             }
             
-            // 记录文件信息
-            if (pathStr) {
-                NSLog(@"[备份调试] 文件 %d/%u: %s, 大小: %llu 字节",
-                      i+1, entryCount, pathStr, dataSize);
-            }
-            
-            // 验证文件路径和数据
             if (pathStr && dataBytes && dataSize > 0) {
                 NSString *fullPath = [_backupContext->backupPath stringByAppendingPathComponent:
                                      [NSString stringWithUTF8String:pathStr]];
@@ -2974,147 +2331,59 @@ typedef struct BackupContext {
                 // 线程安全的文件操作
                 dispatch_sync(self.fileQueue, ^{
                     @autoreleasepool {
-                        // 创建目录结构
-                        NSError *dirError = nil;
                         [[NSFileManager defaultManager] createDirectoryAtPath:dirPath
                                                   withIntermediateDirectories:YES
                                                                    attributes:nil
-                                                                        error:&dirError];
-                        
-                        if (dirError) {
-                            NSLog(@"[备份调试] 创建目录失败: %@", dirError);
-                            [self logWarning:@"创建目录失败: %@", dirError.localizedDescription];
-                        } else {
-                            // 写入文件
-                            NSData *fileData = [NSData dataWithBytes:dataBytes length:dataSize];
-                            NSError *writeError = nil;
-                            BOOL success = [fileData writeToFile:fullPath
-                                                        options:NSDataWritingAtomic
-                                                          error:&writeError];
-                            
-                            if (success) {
-                                bytesReceived += dataSize;
-                                processedCount++;
-                                
-                                // 更新文件权限（可选）
-                                NSDictionary *fileAttrs = @{NSFilePosixPermissions: @(0644)};
-                                [[NSFileManager defaultManager] setAttributes:fileAttrs
-                                                                 ofItemAtPath:fullPath
                                                                         error:nil];
-                                
-                                if (i % 10 == 0 || i == entryCount - 1) {
-                                    NSLog(@"[备份调试] 成功写入文件 %@, 大小: %llu",
-                                          fullPath.lastPathComponent, dataSize);
-                                }
-                                
-                                // 线程安全地更新统计
-                                dispatch_sync(self.stateQueue, ^{
-                                    self.totalBytesReceived += dataSize;
-                                    self.filesProcessed++;
-                                    
-                                    // 每处理10个文件输出一次日志
-                                    if (self.filesProcessed % 10 == 0) {
-                                        NSLog(@"[备份调试] 已处理 %d 个文件，共接收 %lld 字节",
-                                              self.filesProcessed, self.totalBytesReceived);
-                                    }
-                                });
-                                
-                                // 更新估计总大小
-                                [self updateEstimatedTotalBytes];
-                                
-                                // 更新进度
-                                [self updateBackupProgress];
-                            } else {
-                                [self logWarning:@"写入文件失败: %@ - %@", fullPath, writeError.localizedDescription];
-                                NSLog(@"[备份调试] 错误: 写入文件失败: %@", writeError);
-                            }
+                        
+                        NSData *fileData = [NSData dataWithBytes:dataBytes length:dataSize];
+                        NSError *writeError = nil;
+                        BOOL success = [fileData writeToFile:fullPath
+                                                    options:NSDataWritingAtomic
+                                                      error:&writeError];
+                        
+                        if (success) {
+                            bytesReceived += dataSize;
+                            
+                            // 线程安全地更新统计
+                            dispatch_sync(self.stateQueue, ^{
+                                self.totalBytesReceived += dataSize;
+                                self.filesProcessed++;
+                            });
+                            
+                            // 更新估计总大小
+                            [self updateEstimatedTotalBytes];
+                            
+                            // 更新进度
+                            [self updateBackupProgress];
+                        } else {
+                            [self logWarning:@"写入文件失败: %@ - %@", fullPath, writeError.localizedDescription];
                         }
                     }
                 });
-            } else {
-                if (pathStr) {
-                    NSLog(@"[备份调试] 警告: 文件数据无效: %s", pathStr);
-                    [self logWarning:@"文件数据无效: %s", pathStr];
-                } else {
-                    NSLog(@"[备份调试] 警告: 文件路径为空");
-                    [self logWarning:@"文件路径为空"];
-                }
             }
             
-            // 释放资源
             if (pathStr) free(pathStr);
             if (dataBytes) free(dataBytes);
         }
-        
-        NSLog(@"[备份调试] 全部处理完成，成功处理 %d/%u 文件", processedCount, entryCount);
-    } else {
-        NSLog(@"[备份调试] 错误: Entries不是数组或为空");
-        [self logError:@"文件上传请求格式无效或为空"];
     }
     
-    // 发送响应 - 使用标准格式
+    // 发送响应
     dispatch_sync(self.connectionQueue, ^{
         if (_backupContext && _backupContext->backup) {
-            // 创建标准响应格式
             plist_t response = plist_new_dict();
-            
-            // 添加处理结果
-            plist_dict_set_item(response, "Status", plist_new_string("Complete"));
-            
-            // 添加处理的文件数量信息
-            plist_dict_set_item(response, "FilesProcessed", plist_new_uint(processedCount));
-            plist_dict_set_item(response, "TotalFiles", plist_new_uint(entryCount));
-            
-            // 记录收到的总字节数
-            plist_dict_set_item(response, "BytesReceived", plist_new_uint(bytesReceived));
-            
-            NSLog(@"[备份调试] 发送文件上传响应: 处理 %d/%u 文件, 字节数: %lld",
-                  processedCount, entryCount, bytesReceived);
-            
-            // 发送响应
             mobilebackup2_send_status_response(_backupContext->backup, 0, NULL, response);
             plist_free(response);
         }
     });
     
-    // 计算传输速度和输出统计
+    // 计算传输速度
     NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:operationStart];
     if (elapsed > 0 && bytesReceived > 0) {
         double speedMBps = (bytesReceived / 1024.0 / 1024.0) / elapsed;
-        [self logInfo:@"文件传输完成: %d 文件, %@ 数据, 速度: %.2f MB/s",
-                     processedCount,
-                     [DatalogsSettings humanReadableFileSize:bytesReceived],
-                     speedMBps];
-        NSLog(@"[备份调试] 文件传输完成: %d 文件, %.2f MB, 速度: %.2f MB/s",
-              processedCount,
-              bytesReceived / (1024.0 * 1024.0),
-              speedMBps);
-    } else {
-        [self logInfo:@"文件传输完成: %d 文件, %@, 耗时: %.1f 秒",
-                     processedCount,
-                     [DatalogsSettings humanReadableFileSize:bytesReceived],
-                     elapsed];
-        NSLog(@"[备份调试] 文件传输完成: %d 文件, %.2f MB, 耗时: %.1f 秒",
-              processedCount,
-              bytesReceived / (1024.0 * 1024.0),
-              elapsed);
+        [self logInfo:@"文件传输速度: %.2f MB/s", speedMBps];
     }
 }
-
-// 辅助方法 - 格式化字节数为人类可读格式
-- (NSString *)formatBytes:(long long)bytes {
-    if (bytes < 1024) {
-        return [NSString stringWithFormat:@"%lld 字节", bytes];
-    } else if (bytes < 1024 * 1024) {
-        return [NSString stringWithFormat:@"%.2f KB", bytes / 1024.0];
-    } else if (bytes < 1024 * 1024 * 1024) {
-        return [NSString stringWithFormat:@"%.2f MB", bytes / (1024.0 * 1024.0)];
-    } else {
-        return [NSString stringWithFormat:@"%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0)];
-    }
-}
-
-//消息处理方法
 
 - (void)handleProcessMessage:(plist_t)message {
     char *messageNameStr = NULL;
@@ -3126,54 +2395,22 @@ typedef struct BackupContext {
     
     if (messageNameStr) {
         [self logInfo:@"处理消息: %s", messageNameStr];
-        NSLog(@"[备份调试] 处理ProcessMessage: %s", messageNameStr);
         
-        // 根据消息类型发送响应 - 采用更精确的格式
+        // 根据消息类型发送响应
         dispatch_sync(self.connectionQueue, ^{
             if (_backupContext && _backupContext->backup) {
                 plist_t response = plist_new_dict();
+                plist_dict_set_item(response, "MessageName", plist_new_string(messageNameStr));
                 
                 if (strcmp(messageNameStr, "BackupMessageBackupReady") == 0) {
-                    NSLog(@"[备份调试] 处理BackupMessageBackupReady");
-                    plist_dict_set_item(response, "MessageName", plist_new_string(messageNameStr));
                     plist_dict_set_item(response, "Result", plist_new_string("Success"));
-                    
-                    // BackupReady需要更多参数
-                    plist_dict_set_item(response, "Protocol", plist_new_string("com.apple.mobilebackup2"));
-                    
-                    // 返回设备标识符
-                    if (_backupContext->deviceUDID) {
-                        plist_dict_set_item(response, "DeviceID",
-                            plist_new_string([_backupContext->deviceUDID UTF8String]));
-                    }
-                    
-                    mobilebackup2_send_message(_backupContext->backup, messageNameStr, response);
-                }
-                else if (strcmp(messageNameStr, "BackupMessageStatus") == 0) {
-                    NSLog(@"[备份调试] 处理BackupMessageStatus");
-                    plist_dict_set_item(response, "MessageName", plist_new_string(messageNameStr));
+                } else if (strcmp(messageNameStr, "BackupMessageStatus") == 0) {
                     plist_dict_set_item(response, "Status", plist_new_string("Complete"));
-                    
-                    // 检查原消息中是否有错误信息和状态
-                    plist_t statusNode = plist_dict_get_item(message, "Status");
-                    if (statusNode) {
-                        char *statusStr = NULL;
-                        plist_get_string_val(statusNode, &statusStr);
-                        if (statusStr) {
-                            NSLog(@"[备份调试] 原始状态: %s", statusStr);
-                            free(statusStr);
-                        }
-                    }
-                    
-                    mobilebackup2_send_message(_backupContext->backup, messageNameStr, response);
-                }
-                else {
-                    NSLog(@"[备份调试] 处理其他消息类型: %s", messageNameStr);
-                    plist_dict_set_item(response, "MessageName", plist_new_string(messageNameStr));
+                } else {
                     plist_dict_set_item(response, "Status", plist_new_string("Complete"));
-                    mobilebackup2_send_message(_backupContext->backup, messageNameStr, response);
                 }
                 
+                mobilebackup2_send_message(_backupContext->backup, messageNameStr, response);
                 plist_free(response);
             }
         });
@@ -3181,32 +2418,16 @@ typedef struct BackupContext {
         free(messageNameStr);
     } else {
         [self logWarning:@"过程消息名称为空"];
-        NSLog(@"[备份调试] 警告: 过程消息名称为空");
     }
 }
 
-//下载文件处理
-
 - (void)handleDownloadFiles:(plist_t)message {
     [self logInfo:@"处理文件下载请求"];
-    NSLog(@"[备份调试] 开始处理文件下载请求");
-    
-    // 添加完整消息结构日志
-    char *xml_message = NULL;
-    uint32_t xml_length = 0;
-    plist_to_xml(message, &xml_message, &xml_length);
-    if (xml_message) {
-        NSLog(@"[备份调试] 下载请求消息: %s", xml_message);
-        free(xml_message);
-    }
     
     // 解析请求的文件
     plist_t files = plist_dict_get_item(message, "Files");
     plist_t response = plist_new_dict();
     plist_t responseFiles = plist_new_dict();
-    
-    int requestedCount = 0;
-    int foundCount = 0;
     
     // 检查是否是字典格式
     if (files && plist_get_node_type(files) == PLIST_DICT) {
@@ -3225,13 +2446,10 @@ typedef struct BackupContext {
                 // 如果已到字典结尾，退出循环
                 if (!key || !val) break;
                 
-                requestedCount++;
                 NSString *filePath = [NSString stringWithUTF8String:key];
                 NSString *fullPath = [_backupContext->backupPath stringByAppendingPathComponent:filePath];
                 
-                NSLog(@"[备份调试] 请求下载文件: %@", filePath);
-                
-                // 检查文件是否存在
+                // 检查文件是否存在 - 添加__block修饰符
                 __block BOOL fileExists = NO;
                 
                 dispatch_sync(self.fileQueue, ^{
@@ -3239,7 +2457,6 @@ typedef struct BackupContext {
                 });
                 
                 if (fileExists) {
-                    foundCount++;
                     // 安全读取文件
                     __block NSData *fileData = nil;
                     __block NSError *readError = nil;
@@ -3249,38 +2466,23 @@ typedef struct BackupContext {
                     });
                     
                     if (fileData && !readError) {
-                        NSLog(@"[备份调试] 文件读取成功: %@, 大小: %lu", filePath, (unsigned long)fileData.length);
                         plist_t fileData_node = plist_new_data([fileData bytes], [fileData length]);
                         plist_dict_set_item(responseFiles, key, fileData_node);
                     } else {
                         [self logWarning:@"读取文件失败: %@", readError];
-                        NSLog(@"[备份调试] 读取文件失败: %@", readError);
                         plist_t empty_data = plist_new_data(NULL, 0);
                         plist_dict_set_item(responseFiles, key, empty_data);
                     }
                 } else {
-                    NSLog(@"[备份调试] 文件不存在: %@", filePath);
-                    
-                    // 对于关键文件，只有在确认需要时才创建，避免创建无效的备份文件
-                    if ([filePath isEqualToString:@"Info.plist"] ||
-                        [filePath isEqualToString:@"Manifest.plist"] ||
-                        [filePath isEqualToString:@"Status.plist"]) {
-                        
-                        NSLog(@"[备份调试] 尝试处理关键文件请求: %@", filePath);
-                        
-                        if ([filePath isEqualToString:@"Info.plist"]) {
-                            [self createDefaultInfoPlist:filePath fullPath:fullPath responseDict:responseFiles key:key];
-                            foundCount++;
-                        } else if ([filePath isEqualToString:@"Manifest.plist"]) {
-                            [self createDefaultManifestPlist:filePath fullPath:fullPath responseDict:responseFiles key:key];
-                            foundCount++;
-                        } else if ([filePath isEqualToString:@"Status.plist"]) {
-                            [self createDefaultStatusPlist:filePath fullPath:fullPath responseDict:responseFiles key:key];
-                            foundCount++;
-                        }
+                    // 对于某些关键文件，可以创建默认内容
+                    if ([filePath hasSuffix:@"Info.plist"]) {
+                        [self createDefaultInfoPlist:filePath fullPath:fullPath responseDict:responseFiles key:key];
+                    } else if ([filePath hasSuffix:@"Manifest.plist"]) {
+                        [self createDefaultManifestPlist:filePath fullPath:fullPath responseDict:responseFiles key:key];
+                    } else if ([filePath hasSuffix:@"Status.plist"]) {
+                        [self createDefaultStatusPlist:filePath fullPath:fullPath responseDict:responseFiles key:key];
                     } else {
                         // 对于其他文件，返回空数据
-                        NSLog(@"[备份调试] 返回空数据，文件不存在: %@", filePath);
                         plist_t empty_data = plist_new_data(NULL, 0);
                         plist_dict_set_item(responseFiles, key, empty_data);
                     }
@@ -3296,8 +2498,6 @@ typedef struct BackupContext {
             free(iter);
         }
     } else {
-        NSLog(@"[备份调试] 下载请求使用非标准格式");
-        // 非标准格式的处理，尝试作为数组处理
         // 检查是否是数组格式的请求
         plist_t paths_array = NULL;
         
@@ -3334,25 +2534,21 @@ typedef struct BackupContext {
     // 添加文件字典到响应
     plist_dict_set_item(response, "Files", responseFiles);
     
-    // 添加响应统计信息
-    plist_dict_set_item(response, "RequestedCount", plist_new_uint(requestedCount));
-    plist_dict_set_item(response, "FoundCount", plist_new_uint(foundCount));
-    
-    NSLog(@"[备份调试] 下载响应: 请求文件数: %d, 找到文件数: %d", requestedCount, foundCount);
-    
-    // 发送响应
+    // 发送响应 - 修复隐式引用self的警告
+    __weak typeof(self) weakSelf = self;
     dispatch_sync(self.connectionQueue, ^{
-        if (_backupContext && _backupContext->backup) {
-            mobilebackup2_send_status_response(_backupContext->backup, 0, NULL, response);
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        
+        if (strongSelf->_backupContext && strongSelf->_backupContext->backup) {
+            mobilebackup2_send_status_response(strongSelf->_backupContext->backup, 0, NULL, response);
         }
     });
     
     // 释放资源
     plist_free(response);
     [self logInfo:@"文件下载请求处理完成"];
-    NSLog(@"[备份调试] 文件下载请求处理完成");
 }
-
 
 - (void)handleOtherMessage:(char *)dlmessage message:(plist_t)message {
     [self logInfo:@"处理其他消息: %s", dlmessage];
@@ -3785,9 +2981,7 @@ typedef struct BackupContext {
     return success;
 }
 
-//心跳机制
 - (BOOL)sendHeartbeat {
-    NSLog(@"[备份调试] 尝试发送心跳");
     [self logDebug:@"发送心跳信号以保持连接活跃"];
     
     __block BOOL success = NO;
@@ -3797,7 +2991,6 @@ typedef struct BackupContext {
             // 检查连接状态
             if (!_backupContext || !_backupContext->backup) {
                 [self logWarning:@"心跳检测 - 备份客户端已无效，需重建连接"];
-                NSLog(@"[备份调试] 心跳错误: 备份客户端无效");
                 success = NO;
                 return;
             }
@@ -3811,7 +3004,6 @@ typedef struct BackupContext {
                 
                 if (lerr != LOCKDOWN_E_SUCCESS) {
                     [self logWarning:@"心跳过程中设备可能已断开或锁定，错误: %d", lerr];
-                    NSLog(@"[备份调试] 心跳检查设备连接状态失败: %d", lerr);
                     success = NO;
                     return;
                 }
@@ -3821,404 +3013,30 @@ typedef struct BackupContext {
                 }
             }
             
-            // 创建正确的DLMessagePing心跳消息 - 参考device_link_service.c中的实现
-            NSLog(@"[备份调试] 创建标准DLMessagePing心跳消息");
-            plist_t dict = plist_new_dict();
-            plist_dict_set_item(dict, "MessageName", plist_new_string("DLMessagePing"));
+            // 创建并发送心跳消息 - 使用更简单的格式
+            plist_t heartbeat = plist_new_dict();
+            plist_dict_set_item(heartbeat, "Command", plist_new_string("Ping"));
+            plist_dict_set_item(heartbeat, "TargetIdentifier", plist_new_string([_backupContext->deviceUDID UTF8String]));
             
-            // 添加结果字典，与标准实现保持一致
-            plist_t result = plist_new_dict();
-            plist_dict_set_item(result, "Status", plist_new_string("Acknowledged"));
-            plist_dict_set_item(dict, "Result", result);
+            // 发送心跳消息
+            mobilebackup2_error_t heartbeatErr = mobilebackup2_send_status_response(_backupContext->backup, 0, NULL, heartbeat);
+            plist_free(heartbeat);
             
-            // 发送心跳消息 - 使用正确的API
-            NSLog(@"[备份调试] 发送DLMessagePing心跳");
-            mobilebackup2_error_t mb2_err = mobilebackup2_send_message(_backupContext->backup, "DLMessagePing", dict);
-            plist_free(dict);
-            
-            if (mb2_err != MOBILEBACKUP2_E_SUCCESS) {
-                [self logWarning:@"心跳信号发送失败，错误代码: %d", mb2_err];
-                NSLog(@"[备份调试] 心跳发送失败，错误代码: %d", mb2_err);
+            if (heartbeatErr != MOBILEBACKUP2_E_SUCCESS) {
+                [self logWarning:@"心跳信号发送失败，错误代码: %d，设备可能已断开", heartbeatErr];
                 success = NO;
                 return;
             }
             
-            // 尝试接收心跳响应
-            NSLog(@"[备份调试] 尝试接收心跳响应");
-            plist_t ping_response = NULL;
-            char *dlmessage = NULL;
-            mb2_err = mobilebackup2_receive_message(_backupContext->backup, &ping_response, &dlmessage);
-            
-            if (mb2_err == MOBILEBACKUP2_E_SUCCESS && ping_response && dlmessage) {
-                NSLog(@"[备份调试] 收到心跳响应: %s", dlmessage);
-                if (dlmessage) free(dlmessage);
-                if (ping_response) plist_free(ping_response);
-            } else {
-                NSLog(@"[备份调试] 未收到心跳响应或超时，继续执行");
-                // 即使未收到响应也不中断操作
-            }
-            
+            // 等待几百毫秒确保心跳消息发送
+            [NSThread sleepForTimeInterval:0.1];
             success = YES;
-            NSLog(@"[备份调试] 心跳发送成功");
             
         } @catch (NSException *exception) {
             [self logWarning:@"心跳操作异常: %@", exception];
-            NSLog(@"[备份调试] 心跳异常: %@", exception);
             success = NO;
         }
     });
-    
-    return success;
-}
-
-- (void)startHeartbeatTimer {
-    if (!self.heartbeatTimer) {
-        self.heartbeatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.sslQueue);
-        
-        dispatch_source_set_timer(self.heartbeatTimer,
-                                dispatch_time(DISPATCH_TIME_NOW, HEARTBEAT_INTERVAL * NSEC_PER_SEC),
-                                HEARTBEAT_INTERVAL * NSEC_PER_SEC,
-                                0.1 * NSEC_PER_SEC);
-        
-        dispatch_source_set_event_handler(self.heartbeatTimer, ^{
-            [self handleHeartbeatWithTimeout:HEARTBEAT_TIMEOUT completion:^(BOOL success, NSError *error) {
-                if (!success) {
-                    [self logError:@"心跳检测失败: %@", error.localizedDescription];
-                    // 可以在这里添加重试或其他错误处理逻辑
-                }
-            }];
-        });
-        
-        dispatch_resume(self.heartbeatTimer);
-    }
-}
-
-- (void)stopHeartbeatTimer {
-    if (self.heartbeatTimer) {
-        dispatch_source_cancel(self.heartbeatTimer);
-        self.heartbeatTimer = nil;
-    }
-}
-
-
-// 修改心跳处理方法
-- (BOOL)handleHeartbeat:(NSError **)error {
-    __block BOOL success = NO;
-    __block NSError *localError = nil;
-    
-    dispatch_sync(self.sslQueue, ^{
-        if (![self isSSLValid]) {
-            [self incrementSSLFailureCount];
-            if ([self sslFailureCount] > MAX_SSL_RETRIES) {
-                localError = [self createError:MFCToolBackupErrorSSL
-                                 description:@"SSL连接状态无效，需要重新建立连接"];
-                return;
-            }
-        }
-        
-        plist_t ping = plist_new_dict();
-        if (!ping) {
-            localError = [self createError:MFCToolBackupErrorInternal
-                             description:@"无法创建心跳消息"];
-            return;
-        }
-        
-        @try {
-            plist_dict_set_item(ping, "MessageName", plist_new_string("DLMessagePing"));
-            plist_dict_set_item(ping, "Timestamp",
-                              plist_new_string([[@(time(NULL)) stringValue] UTF8String]));
-            
-            if (![self verifyDeviceConnection]) {
-                localError = [self createError:MFCToolBackupErrorDeviceConnection
-                                 description:@"设备连接已断开"];
-                return;
-            }
-            
-            __block BOOL timeoutOccurred = NO;
-            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-            dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
-                                                          0, 0, self.sslQueue);
-            
-            if (timer) {
-                dispatch_source_set_timer(timer,
-                                        dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
-                                        DISPATCH_TIME_FOREVER, 0);
-                
-                dispatch_source_set_event_handler(timer, ^{
-                    timeoutOccurred = YES;
-                    dispatch_semaphore_signal(sem);
-                });
-                
-                dispatch_resume(timer);
-            }
-            
-            mobilebackup2_error_t mb2_err = mobilebackup2_send_message(_backupContext->backup,
-                                                                    "DLMessagePing",
-                                                                    ping);
-            
-            if (mb2_err == MOBILEBACKUP2_E_SUCCESS) {
-                char *dlmessage = NULL;
-                plist_t response = NULL;
-                
-                mb2_err = mobilebackup2_receive_message(_backupContext->backup,
-                                                      &response,
-                                                      &dlmessage);
-                
-                if (mb2_err == MOBILEBACKUP2_E_SUCCESS && dlmessage) {
-                    if (strcmp(dlmessage, "DLMessageProcessMessage") == 0) {
-                        success = YES;
-                        [self updateSSLState:^(SSLConnectionState *state) {
-                            state->isValid = 1;
-                            state->lastSuccess = time(NULL);
-                            state->failureCount = 0;
-                        }];
-                    }
-                    free(dlmessage);
-                }
-                
-                if (response) {
-                    plist_free(response);
-                }
-            }
-            
-            if (timer) {
-                dispatch_source_cancel(timer);
-            }
-            
-            if (!success) {
-                if (timeoutOccurred) {
-                    localError = [self createError:MFCToolBackupErrorTimeout
-                                     description:@"心跳请求超时"];
-                } else if (mb2_err == MOBILEBACKUP2_E_SSL_ERROR) {
-                    [self setSSLValid:NO];
-                    [self logError:@"SSL心跳失败，错误码: %d", mb2_err];
-                    
-                    if ([self recoverSSLSession]) {
-                        success = YES;
-                    } else {
-                        localError = [self createError:MFCToolBackupErrorSSL
-                                         description:@"无法恢复SSL会话"];
-                    }
-                } else {
-                    localError = [self createError:MFCToolBackupErrorCommunication
-                                     description:[NSString stringWithFormat:@"心跳失败，错误码: %d", mb2_err]];
-                }
-            }
-        } @catch (NSException *exception) {
-            [self logError:@"心跳处理异常: %@", exception];
-            localError = [self createError:MFCToolBackupErrorInternal
-                             description:[NSString stringWithFormat:@"心跳处理异常: %@", exception.reason]];
-        } @finally {
-            if (ping) {
-                plist_free(ping);
-            }
-        }
-    });
-    
-    if (error && localError) {
-        *error = localError;
-    }
-    
-    return success;
-}
-
-- (BOOL)verifyDeviceConnection {
-    if (!_backupContext || !_backupContext->device || !_backupContext->lockdown) {
-        return NO;
-    }
-    
-    char *deviceName = NULL;
-    lockdownd_error_t lerr = lockdownd_get_device_name(_backupContext->lockdown, &deviceName);
-    
-    if (deviceName) {
-        free(deviceName);
-    }
-    
-    return (lerr == LOCKDOWN_E_SUCCESS);
-}
-
-
-// 6. 添加心跳超时保护
-- (void)handleHeartbeatWithTimeout:(NSTimeInterval)timeout completion:(void (^)(BOOL success, NSError *error))completion {
-    dispatch_async(self.sslQueue, ^{
-        __block BOOL success = NO;
-        __block NSError *error = nil;
-        
-        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-        dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.sslQueue);
-        
-        if (timer) {
-            dispatch_source_set_timer(timer,
-                                    dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)),
-                                    DISPATCH_TIME_FOREVER, 0);
-            
-            dispatch_source_set_event_handler(timer, ^{
-                [self logWarning:@"心跳检查超时"];
-                error = [self createError:MFCToolBackupErrorTimeout
-                             description:@"心跳检查超时"];
-                dispatch_semaphore_signal(semaphore);
-            });
-            
-            dispatch_resume(timer);
-        }
-        
-        @try {
-            success = [self performHeartbeatCheck:&error];
-        } @catch (NSException *exception) {
-            error = [self createError:MFCToolBackupErrorSSL
-                         description:[NSString stringWithFormat:@"心跳处理异常: %@", exception.reason]];
-            success = NO;
-        }
-        
-        if (timer) {
-            dispatch_source_cancel(timer);
-        }
-        
-        if (completion) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                completion(success, error);
-            });
-        }
-    });
-}
-
-// 7. 添加心跳检查的核心方法
-- (BOOL)performHeartbeatCheck:(NSError **)error {
-    if (![self isSSLValid]) {
-        [self incrementSSLFailureCount];
-        if ([self sslFailureCount] > MAX_SSL_RETRIES) {
-            if (error) {
-                *error = [self createError:MFCToolBackupErrorSSL
-                             description:@"SSL连接状态无效，需要重新建立连接"];
-            }
-            return NO;
-        }
-    }
-    
-    plist_t ping = plist_new_dict();
-    if (!ping) {
-        if (error) {
-            *error = [self createError:MFCToolBackupErrorInternal
-                         description:@"无法创建心跳消息"];
-        }
-        return NO;
-    }
-    
-    BOOL success = NO;
-    @try {
-        // 添加心跳消息内容
-        plist_dict_set_item(ping, "MessageName", plist_new_string("DLMessagePing"));
-        plist_dict_set_item(ping, "Timestamp",
-                          plist_new_string([[@(time(NULL)) stringValue] UTF8String]));
-        
-        // 发送心跳消息
-        mobilebackup2_error_t mb2_err = mobilebackup2_send_message(_backupContext->backup,
-                                                                "DLMessagePing",
-                                                                ping);
-        
-        if (mb2_err == MOBILEBACKUP2_E_SUCCESS) {
-            char *dlmessage = NULL;
-            plist_t response = NULL;
-            
-            mb2_err = mobilebackup2_receive_message(_backupContext->backup,
-                                                  &response,
-                                                  &dlmessage);
-            
-            if (mb2_err == MOBILEBACKUP2_E_SUCCESS && dlmessage) {
-                if (strcmp(dlmessage, "DLMessageProcessMessage") == 0) {
-                    success = YES;
-                    [self updateSSLState:^(SSLConnectionState *state) {
-                        state->isValid = YES;
-                        state->lastSuccess = time(NULL);
-                        state->failureCount = 0;
-                    }];
-                }
-                free(dlmessage);
-            }
-            
-            if (response) {
-                plist_free(response);
-            }
-        }
-        
-        if (!success) {
-            if (mb2_err == MOBILEBACKUP2_E_SSL_ERROR) {
-                [self setSSLValid:NO];
-                [self logError:@"SSL心跳失败，错误码: %d", mb2_err];
-                
-                if ([self recoverSSLSession]) {
-                    success = YES;
-                } else if (error) {
-                    *error = [self createError:MFCToolBackupErrorSSL
-                                 description:@"无法恢复SSL会话"];
-                }
-            } else if (error) {
-                *error = [self createError:MFCToolBackupErrorCommunication
-                             description:[NSString stringWithFormat:@"心跳失败，错误码: %d", mb2_err]];
-            }
-        }
-    } @catch (NSException *exception) {
-        if (error) {
-            *error = [self createError:MFCToolBackupErrorInternal
-                         description:[NSString stringWithFormat:@"心跳检查异常: %@", exception.reason]];
-        }
-        success = NO;
-    } @finally {
-        if (ping) {
-            plist_free(ping);
-        }
-    }
-    
-    return success;
-}
-
-// 添加SSL会话恢复方法
-- (BOOL)recoverSSLSession {
-    [self logInfo:@"开始恢复SSL会话"];
-    
-    BOOL success = NO;
-    lockdownd_error_t lerr;
-    lockdownd_service_descriptor_t service = NULL;
-    
-    // 重新启动备份服务
-    lerr = lockdownd_start_service(_backupContext->lockdown,
-                                "com.apple.mobilebackup2",
-                                &service);
-    
-    if (lerr == LOCKDOWN_E_SUCCESS && service) {
-        if (_backupContext->backup) {
-            mobilebackup2_client_free(_backupContext->backup);
-            _backupContext->backup = NULL;
-        }
-        
-        // 创建新的备份客户端
-        mobilebackup2_error_t mb2err = mobilebackup2_client_new(_backupContext->device,
-                                                             service,
-                                                             &_backupContext->backup);
-        
-        if (mb2err == MOBILEBACKUP2_E_SUCCESS) {
-            [self logInfo:@"成功创建新的备份客户端"];
-            
-            // 重新进行版本协商
-            mb2err = mobilebackup2_version_exchange(_backupContext->backup,
-                                                MBACKUP2_VERSION_INT1,
-                                                MBACKUP2_VERSION_INT2,
-                                                &_backupContext->protocolVersion);
-            
-            if (mb2err == MOBILEBACKUP2_E_SUCCESS) {
-                [self logInfo:@"SSL会话恢复成功，协议版本: %.1f", _backupContext->protocolVersion];
-                success = YES;
-            } else {
-                [self logError:@"SSL会话恢复失败 - 版本协商失败: %d", mb2err];
-            }
-        } else {
-            [self logError:@"SSL会话恢复失败 - 创建备份客户端失败: %d", mb2err];
-        }
-        
-        lockdownd_service_descriptor_free(service);
-    } else {
-        [self logError:@"SSL会话恢复失败 - 启动服务失败: %d", lerr];
-    }
     
     return success;
 }
@@ -4946,3 +3764,134 @@ typedef struct BackupContext {
 }
 
 @end
+
+
+//
+//  BackupTask.h
+//  MFCTOOL
+//
+//  Created by Monterey on 5/5/2025.
+//
+
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+// 错误域
+extern NSString *const MFCToolBackupErrorDomain;
+
+// 错误代码 在 MFCToolBackupError 枚举中添加新的错误类型
+typedef NS_ENUM(NSInteger, MFCToolBackupError) {
+    MFCToolBackupErrorInternal = 1,          // 内部错误
+    MFCToolBackupErrorDeviceConnection = 2,   // 设备连接错误
+    MFCToolBackupErrorLockdown = 3,           // Lockdown错误
+    MFCToolBackupErrorService = 4,            // 服务错误
+    MFCToolBackupErrorProtocol = 5,           // 协议错误
+    MFCToolBackupErrorFileOperation = 6,      // 文件操作错误
+    MFCToolBackupErrorDiskSpace = 7,          // 磁盘空间不足
+    MFCToolBackupErrorTrustNotEstablished = 8,// 设备未信任
+    MFCToolBackupErrorCancelled = 9,          // 用户取消
+    MFCToolBackupErrorTimeout = 10,           // 操作超时
+    // 新增错误类型
+    MFCToolBackupErrorInvalidPassword = 11,   // 无效密码
+    MFCToolBackupErrorEncryptionFailed = 12,  // 加密失败
+    MFCToolBackupErrorIncomplete = 13,        // 备份未完成
+    MFCToolBackupErrorBackupFailed = 14,      // 备份失败
+    MFCToolBackupErrorDeviceLocked = 15,      // 设备已锁定
+    MFCToolBackupErrorNetworkError = 16,      // 网络错误
+    MFCToolBackupErrorProtocolMismatch = 17,  // 协议不匹配
+    MFCToolBackupErrorInsufficientPermission = 18, // 权限不足
+    MFCToolBackupErrorDeviceDetached = 19,    // 设备已分离
+    MFCToolBackupErrorDeviceBusy = 20         // 设备忙
+};
+
+
+
+// 备份状态
+typedef NS_ENUM(NSInteger, BackupState) {
+    BackupStateIdle,                // 空闲状态
+    BackupStateInitializing,        // 初始化中
+    BackupStateNegotiating,         // 协议协商中
+    BackupStateRequiringPassword,   // 需要密码
+    BackupStateBackingUp,           // 备份进行中
+    BackupStateCompleted,           // 已完成
+    BackupStateError,               // 错误状态
+    BackupStateCancelled            // 已取消
+};
+
+// 回调块定义
+typedef void (^BackupProgressBlock)(double progress, NSString *message);
+typedef void (^BackupCompletionBlock)(BOOL success, NSError * _Nullable error);
+typedef void (^BackupPasswordBlock)(NSString * _Nullable password);
+
+/**
+ * BackupTask - 用于管理设备备份操作的类
+ *
+ * 此类负责执行iOS设备的备份操作，提供进度追踪和状态管理功能。
+ * 采用单例模式确保在整个应用中只有一个备份任务实例。
+ */
+@interface BackupTask : NSObject
+
+// 进度和估算信息
+@property (nonatomic, assign, readonly) long long estimatedTotalBytes;
+@property (nonatomic, assign, readonly) double currentProgress;
+@property (nonatomic, assign, readonly) BackupState currentState;
+
+/**
+ * 获取单例实例
+ */
++ (instancetype)sharedInstance;
+
+/**
+ * 开始备份指定设备
+ *
+ * @param udid 设备的UDID
+ * @param progressCallback 进度更新回调
+ * @param completionCallback 完成回调
+ */
+- (void)startBackupForDevice:(NSString *)udid
+                    progress:(nullable BackupProgressBlock)progressCallback
+                  completion:(nullable BackupCompletionBlock)completionCallback;
+
+/**
+ * 暂停当前备份操作
+ */
+- (void)pauseBackup;
+
+/**
+ * 恢复已暂停的备份操作
+ */
+- (void)resumeBackup;
+
+/**
+ * 取消当前备份操作
+ */
+- (void)cancelBackup;
+
+/**
+ * 提供加密备份所需的密码
+ *
+ * @param password 加密备份密码
+ */
+- (void)providePassword:(nullable NSString *)password;
+
+/**
+ * 获取估计的备份总大小（字节数）
+ */
+- (long long)getEstimatedTotalBytes;
+
+/**
+ * 获取格式化的估计备份大小（如"10.5 GB"）
+ */
+- (NSString *)getEstimatedTotalBytesFormatted;
+
+/**
+ * 设置诊断日志级别
+ *
+ * @param level 日志级别（0-4，默认为1）
+ */
+- (void)setLogLevel:(NSInteger)level;
+
+@end
+
+NS_ASSUME_NONNULL_END
