@@ -2489,7 +2489,7 @@ static void notification_cb(const char *notification, void *user_data) {
         NSLog(@"[BackupTask] Path contains UDID, using local path: %@", filePath);
         
         // 关键修改：发送回设备时去掉 UDID 前缀
-        // 例如：设备请求 "00008030-0008352034B9802E/Status.plist"，但我们只发送 "Status.plist"
+        // 例如：设备请求 "/Users/monterey/Library/Backups/00008030-0008352034B9802E/Status.plist"，但我们只发送 "Status.plist"
         if (is_status_plist) {
             // 特殊处理 Status.plist，只发送文件名部分
             send_path = "Status.plist";
