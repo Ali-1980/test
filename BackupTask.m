@@ -848,110 +848,119 @@ static void notification_cb(const char *notification, void *user_data) {
         }
     }
     
-    // 3. 确保设备备份目录存在
-    NSString *devBackupDir = [_backupDirectory stringByAppendingPathComponent:_sourceUDID];
+    // 3. 确保设备备份目录存在并处理
+    NSString *devBackupDir = [_backupDirectory stringByAppendingPathComponent:_deviceUDID];
     BOOL isDir;
-    if (![[NSFileManager defaultManager] fileExistsAtPath:devBackupDir isDirectory:&isDir] || !isDir) {
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    
+    // 检查并移除错误的备份目录
+    NSString *wrongBackupDir = [devBackupDir stringByAppendingPathComponent:_deviceUDID];
+    if ([fileManager fileExistsAtPath:wrongBackupDir isDirectory:&isDir] && isDir) {
+        NSLog(@"[BackupTask] Removing incorrectly nested backup directory: %@", wrongBackupDir);
+        NSError *removeError = nil;
+        if (![fileManager removeItemAtPath:wrongBackupDir error:&removeError]) {
+            NSLog(@"[BackupTask] Error removing nested directory: %@", removeError);
+        }
+    }
+    
+    // 创建正确的备份目录
+    if (![fileManager fileExistsAtPath:devBackupDir isDirectory:&isDir] || !isDir) {
         NSLog(@"[BackupTask] Creating backup directory: %@", devBackupDir);
         NSError *dirError = nil;
-        if (![[NSFileManager defaultManager] createDirectoryAtPath:devBackupDir
-                                     withIntermediateDirectories:YES
-                                                      attributes:nil
-                                                           error:&dirError]) {
+        if (![fileManager createDirectoryAtPath:devBackupDir
+                    withIntermediateDirectories:YES
+                                     attributes:nil
+                                          error:&dirError]) {
             NSLog(@"[BackupTask] Error creating backup directory: %@", dirError);
             if (error) {
                 *error = [self errorWithCode:BackupTaskErrorCodeInvalidBackupDirectory
-                                 description:[NSString stringWithFormat:@"Could not create backup directory: %@",
-                                             dirError.localizedDescription]];
+                                description:[NSString stringWithFormat:@"Could not create backup directory: %@",
+                                            dirError.localizedDescription]];
             }
             return NO;
         }
     }
     
-    // 添加：创建初始状态文件
+    // 4. 处理 Status.plist
     NSString *statusPath = [devBackupDir stringByAppendingPathComponent:@"Status.plist"];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:statusPath]) {
-        // 创建初始状态文件
-        plist_t status_dict = plist_new_dict();
-        plist_dict_set_item(status_dict, "SnapshotState", plist_new_string("new"));
-        plist_dict_set_item(status_dict, "UUID", plist_new_string([_deviceUDID UTF8String]));
-        
-        // 添加当前日期 (从2001年开始，苹果的Mac纪元)
-        int32_t date_time = (int32_t)time(NULL) - 978307200;
-        plist_dict_set_item(status_dict, "Date", plist_new_date(date_time, 0));
-        
-        uint32_t length = 0;
-        char *xml = NULL;
-        plist_to_xml(status_dict, &xml, &length);
-        if (xml) {
-            NSData *plistData = [NSData dataWithBytes:xml length:length];
-            BOOL writeSuccess = [plistData writeToFile:statusPath atomically:YES];
-            free(xml);
-            
-            if (writeSuccess) {
-                NSLog(@"[BackupTask] Created initial Status.plist at: %@", statusPath);
-            } else {
-                NSLog(@"[BackupTask] Failed to write Status.plist to: %@", statusPath);
+    NSString *wrongStatusPath = [devBackupDir stringByAppendingPathComponent:[_deviceUDID stringByAppendingPathComponent:@"Status.plist"]];
+    
+    // 移除错误位置的 Status.plist
+    if ([fileManager fileExistsAtPath:wrongStatusPath]) {
+        NSLog(@"[BackupTask] Removing Status.plist from incorrect location: %@", wrongStatusPath);
+        NSError *removeError = nil;
+        if (![fileManager removeItemAtPath:wrongStatusPath error:&removeError]) {
+            NSLog(@"[BackupTask] Error removing incorrect Status.plist: %@", removeError);
+        }
+    }
+    
+    // 创建或更新 Status.plist
+    plist_t status_dict = plist_new_dict();
+    plist_dict_set_item(status_dict, "SnapshotState", plist_new_string("new"));
+    plist_dict_set_item(status_dict, "UUID", plist_new_string([_deviceUDID UTF8String]));
+    plist_dict_set_item(status_dict, "Version", plist_new_string("2.4"));
+    
+    // 添加当前时间戳 (使用 Apple 纪元 - 从2001年开始)
+    int32_t date_time = (int32_t)time(NULL) - 978307200;
+    plist_dict_set_item(status_dict, "Date", plist_new_date(date_time, 0));
+    
+    // 序列化并保存 Status.plist
+    uint32_t length = 0;
+    char *xml = NULL;
+    plist_to_xml(status_dict, &xml, &length);
+    
+    if (xml) {
+        NSData *plistData = [NSData dataWithBytes:xml length:length];
+        NSError *writeError = nil;
+        if (![plistData writeToFile:statusPath options:NSDataWritingAtomic error:&writeError]) {
+            NSLog(@"[BackupTask] Error writing Status.plist: %@", writeError);
+            if (error) {
+                *error = [self errorWithCode:BackupTaskErrorCodeOperationFailed
+                                description:@"Failed to create Status.plist"];
             }
+            free(xml);
+            plist_free(status_dict);
+            return NO;
         }
-        plist_free(status_dict);
-    } else {
-        NSLog(@"[BackupTask] Status.plist already exists at: %@", statusPath);
+        free(xml);
+        NSLog(@"[BackupTask] Successfully created/updated Status.plist at: %@", statusPath);
+    }
+    plist_free(status_dict);
+    
+    // 设置正确的文件权限
+    NSError *chmodError = nil;
+    NSDictionary *attributes = @{NSFilePosixPermissions: @(0644)};
+    if (![fileManager setAttributes:attributes ofItemAtPath:statusPath error:&chmodError]) {
+        NSLog(@"[BackupTask] Warning: Could not set Status.plist permissions: %@", chmodError);
     }
     
-    // 验证不会在错误的路径创建 Status.plist
-    NSString *wrongPath = [devBackupDir stringByAppendingPathComponent:[_deviceUDID stringByAppendingPathComponent:@"Status.plist"]];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:wrongPath]) {
-        NSLog(@"[BackupTask] Warning: Status.plist found at incorrect path: %@", wrongPath);
-        NSError *removeError;
-        if ([[NSFileManager defaultManager] removeItemAtPath:wrongPath error:&removeError]) {
-            NSLog(@"[BackupTask] Removed duplicate Status.plist file at incorrect path");
-        } else {
-            NSLog(@"[BackupTask] Failed to remove duplicate Status.plist: %@", removeError);
-        }
-    }
+    // 5. 创建备份选项
+    plist_t opts = plist_new_dict();
     
-    if (![_sourceUDID isEqualToString:_deviceUDID]) {
-        // 处理不同源备份目录
-        NSString *targetBackupDir = [_backupDirectory stringByAppendingPathComponent:_deviceUDID];
-        [[NSFileManager defaultManager] createDirectoryAtPath:targetBackupDir
-                                  withIntermediateDirectories:YES
-                                                   attributes:nil
-                                                        error:nil];
-    }
-    
-    // 4. 创建选项
-    plist_t opts = NULL;
+    // 强制全量备份选项
     if (_options & BackupTaskOptionForceFullBackup) {
         NSLog(@"[BackupTask] Enforcing full backup from device");
-        opts = plist_new_dict();
         plist_dict_set_item(opts, "ForceFullBackup", plist_new_bool(1));
     }
     
-    // 如果备份需要加密，添加密码到选项中
+    // 加密选项
     if (isEncrypted && _backupPassword) {
-        if (!opts) {
-            opts = plist_new_dict();
-        }
         plist_dict_set_item(opts, "Password", plist_new_string([_backupPassword UTF8String]));
         NSLog(@"[BackupTask] Using backup password for encrypted backup");
     }
     
-    // 5. 请求备份
+    // 6. 发送备份请求
     [self updateProgress:5 operation:@"Requesting backup from device" current:5 total:100];
     
     NSLog(@"[BackupTask] Backup %@ and will %sbe encrypted",
           (_options & BackupTaskOptionForceFullBackup) ? @"will be full" : @"may be incremental",
           isEncrypted ? "" : "not ");
     
-    _estimatedBackupSize = 0; // 初始化估计备份大小
-    _actualBackupSize = 0;    // 初始化实际备份大小
-    
-    // 发送备份请求
     mobilebackup2_error_t err = mobilebackup2_send_request(_mobilebackup2, "Backup",
-                                                          [_deviceUDID UTF8String],
-                                                          [_sourceUDID UTF8String],
-                                                          opts);
+                                                         [_deviceUDID UTF8String],
+                                                         [_sourceUDID UTF8String],
+                                                         opts);
+    
     if (opts) {
         plist_free(opts);
     }
@@ -972,16 +981,43 @@ static void notification_cb(const char *notification, void *user_data) {
         return NO;
     }
     
-    // 6. 处理设备上的密码请求
+    // 7. 处理设备上的密码请求
     if (_passcodeRequested) {
         NSLog(@"[BackupTask] Waiting for device passcode entry");
         [self updateProgress:10 operation:@"Waiting for device passcode" current:10 total:100];
+        
+        // 等待用户输入设备密码
+        NSTimeInterval timeout = 60.0; // 60秒超时
+        NSTimeInterval startTime = [NSDate timeIntervalSinceReferenceDate];
+        
+        while (_passcodeRequested) {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                   beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+            
+            if ([NSDate timeIntervalSinceReferenceDate] - startTime > timeout) {
+                NSLog(@"[BackupTask] Device passcode entry timed out");
+                if (error) {
+                    *error = [self errorWithCode:BackupTaskErrorCodeOperationFailed
+                                    description:@"Device passcode entry timed out"];
+                }
+                return NO;
+            }
+            
+            if (_cancelRequested) {
+                NSLog(@"[BackupTask] Operation cancelled while waiting for passcode");
+                if (error) {
+                    *error = [self errorWithCode:BackupTaskErrorCodeUserCancelled
+                                    description:@"Operation cancelled by user"];
+                }
+                return NO;
+            }
+        }
     }
     
-    // 7. 处理备份消息
+    // 8. 处理备份消息
     BOOL result = [self processBackupMessages:error];
     
-    // 8. 解锁备份锁
+    // 9. 解锁备份锁
     if (_lockfile) {
         afc_file_lock(_afc, _lockfile, AFC_LOCK_UN);
         afc_file_close(_afc, _lockfile);
