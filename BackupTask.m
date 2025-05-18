@@ -2880,12 +2880,12 @@ static void notification_cb(const char *notification, void *user_data) {
     NSLog(@"[BackupTask] 显示密码输入对话框: %@", message);
     
     // 最大尝试次数和当前尝试计数
-    int maxAttempts = 3;
+    const int maxAttempts = 3;  // 最多允许3次尝试
     int attemptCount = 0;
-    int passwordErrorCount = 0; // 只统计真正的密码错误
+    int passwordErrorCount = 0;  // 只统计真正的密码错误
     NSString *password = nil;
     
-    // 主循环 - 尝试最多maxAttempts次，直到密码验证成功或用户取消
+    // 主循环 - 尝试直到密码验证成功或达到最大尝试次数
     while (passwordErrorCount < maxAttempts) {
         dispatch_semaphore_t dialogSemaphore = dispatch_semaphore_create(0);
         __block BOOL userCancelled = NO;
@@ -2893,17 +2893,16 @@ static void notification_cb(const char *notification, void *user_data) {
         
         // 在主线程创建并显示对话框
         dispatch_async(dispatch_get_main_queue(), ^{
-            // 创建警告框
             NSAlert *alert = [[NSAlert alloc] init];
             [alert setMessageText:@"备份密码"];
             
-            // 设置提示信息
+            // 根据尝试次数设置不同的提示信息
             NSString *infoText;
             if (attemptCount == 0) {
                 infoText = message ?: @"此设备启用了加密备份，请输入备份密码";
             } else {
-                infoText = [NSString stringWithFormat:@"密码验证失败，请重新输入（尝试 %d/%d）",
-                           passwordErrorCount + 1, maxAttempts];
+                infoText = [NSString stringWithFormat:@"密码验证失败，请重新输入（剩余尝试次数：%d）",
+                           maxAttempts - passwordErrorCount];
             }
             [alert setInformativeText:infoText];
             
@@ -2919,7 +2918,6 @@ static void notification_cb(const char *notification, void *user_data) {
             [alert beginSheetModalForWindow:[[NSApplication sharedApplication] mainWindow]
                          completionHandler:^(NSModalResponse returnCode) {
                 if (returnCode == NSAlertFirstButtonReturn) {
-                    // 用户点击确定按钮
                     NSString *input = [passwordField stringValue];
                     if (input.length > 0) {
                         enteredPassword = input;
@@ -2927,11 +2925,8 @@ static void notification_cb(const char *notification, void *user_data) {
                         userCancelled = YES;
                     }
                 } else {
-                    // 用户点击取消按钮
                     userCancelled = YES;
                 }
-                
-                // 释放信号量，允许继续执行
                 dispatch_semaphore_signal(dialogSemaphore);
             }];
             
@@ -2955,40 +2950,18 @@ static void notification_cb(const char *notification, void *user_data) {
             return enteredPassword;
         }
         
-        // 显示验证中的对话框
-        __block NSAlert *progressAlert = nil;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            progressAlert = [[NSAlert alloc] init];
-            [progressAlert setMessageText:@"验证中"];
-            [progressAlert setInformativeText:@"正在验证备份密码，请稍候..."];
-            
-            NSProgressIndicator *progressIndicator = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(0, 0, 300, 20)];
-            [progressIndicator setIndeterminate:YES];
-            [progressIndicator startAnimation:nil];
-            [progressAlert setAccessoryView:progressIndicator];
-            
-            NSWindow *progressWindow = [progressAlert window];
-            [progressWindow center];
-            [progressWindow makeKeyAndOrderFront:nil];
-        });
+        // 开始验证密码
+        NSLog(@"[BackupTask] 正在验证备份密码，请稍候...");
         
         // 验证密码
         NSError *verifyError = nil;
         BOOL isValid = [self verifyBackupPasswordSecure:enteredPassword error:&verifyError];
-        
-        // 关闭进度对话框
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (progressAlert) {
-                [[progressAlert window] orderOut:nil];
-            }
-        });
         
         // 增加总尝试计数
         attemptCount++;
         
         // 处理验证结果
         if (isValid) {
-            // 密码验证成功
             NSLog(@"[BackupTask] 密码验证成功");
             password = enteredPassword;
             break;
@@ -3002,31 +2975,16 @@ static void notification_cb(const char *notification, void *user_data) {
             if (isPasswordError) {
                 // 真正的密码错误，增加密码错误计数
                 passwordErrorCount++;
-                NSLog(@"[BackupTask] 密码错误（尝试 %d/%d）", passwordErrorCount, maxAttempts);
+                NSLog(@"[BackupTask] 密码错误（剩余尝试次数：%d）", maxAttempts - passwordErrorCount);
             } else {
-                // 其他错误，不增加密码错误计数，但给出错误提示
-                NSLog(@"[BackupTask] 验证过程中出现通信错误: %@", verifyError.localizedDescription);
-                
-                // 在UI上显示通信错误提示
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    NSAlert *errorAlert = [[NSAlert alloc] init];
-                    [errorAlert setMessageText:@"验证过程中出现错误"];
-                    [errorAlert setInformativeText:[NSString stringWithFormat:@"连接设备时出现问题：%@\n\n这不会计入密码尝试次数，请重试。",
-                                                  verifyError.localizedDescription]];
-                    [errorAlert runModal];
-                });
+                // 通信错误或其他错误
+                NSLog(@"[BackupTask] 验证失败：%@", verifyError.localizedDescription ?: @"验证过程中出现错误");
             }
-            
-            // 如果达到最大密码尝试次数，显示最终错误
-            if (passwordErrorCount >= maxAttempts) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    NSAlert *finalError = [[NSAlert alloc] init];
-                    [finalError setMessageText:@"密码验证失败"];
-                    [finalError setInformativeText:@"已达到最大尝试次数，备份操作取消"];
-                    [finalError runModal];
-                });
-                break;
-            }
+        }
+        
+        if (passwordErrorCount >= maxAttempts) {
+            NSLog(@"[BackupTask] 密码验证失败：已达到最大尝试次数，备份操作取消");
+            break;
         }
     }
     
@@ -3161,8 +3119,6 @@ static void notification_cb(const char *notification, void *user_data) {
         if (dlmsg) free(dlmsg);
     }
 }
-
-
 
 
 #pragma mark - 文件处理方法
