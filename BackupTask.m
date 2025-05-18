@@ -2953,12 +2953,38 @@ static void notification_cb(const char *notification, void *user_data) {
         // 开始验证密码
         NSLog(@"[BackupTask] 正在验证备份密码，请稍候...");
         
-        // 验证密码
-        NSError *verifyError = nil;
-        BOOL isValid = [self verifyBackupPasswordSecure:enteredPassword error:&verifyError];
+        // 创建信号量用于同步验证结果
+        dispatch_semaphore_t verifySemaphore = dispatch_semaphore_create(0);
+        __block BOOL isValid = NO;
+        __block NSError *verifyError = nil;
+        
+        // 在后台线程进行验证
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            NSError *error = nil;
+            isValid = [self verifyBackupPasswordSecure:enteredPassword error:&error];
+            if (error) {
+                verifyError = error;
+            }
+            dispatch_semaphore_signal(verifySemaphore);
+        });
+        
+        // 等待验证完成或超时（设置15秒超时）
+        long result = dispatch_semaphore_wait(verifySemaphore, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
+        BOOL timeoutOccurred = (result != 0);
         
         // 增加总尝试计数
         attemptCount++;
+        
+        if (timeoutOccurred) {
+            // 显示超时错误对话框
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSAlert *timeoutAlert = [[NSAlert alloc] init];
+                [timeoutAlert setMessageText:@"验证超时"];
+                [timeoutAlert setInformativeText:@"密码验证超时，请重试"];
+                [timeoutAlert runModal];
+            });
+            continue;
+        }
         
         // 处理验证结果
         if (isValid) {
@@ -2975,14 +3001,38 @@ static void notification_cb(const char *notification, void *user_data) {
             if (isPasswordError) {
                 // 真正的密码错误，增加密码错误计数
                 passwordErrorCount++;
+                
+                // 显示错误对话框
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSAlert *errorAlert = [[NSAlert alloc] init];
+                    [errorAlert setMessageText:@"密码错误"];
+                    [errorAlert setInformativeText:[NSString stringWithFormat:@"请重新输入密码（剩余尝试次数：%d）",
+                                                  maxAttempts - passwordErrorCount]];
+                    [errorAlert runModal];
+                });
+                
                 NSLog(@"[BackupTask] 密码错误（剩余尝试次数：%d）", maxAttempts - passwordErrorCount);
             } else {
                 // 通信错误或其他错误
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSAlert *errorAlert = [[NSAlert alloc] init];
+                    [errorAlert setMessageText:@"验证失败"];
+                    [errorAlert setInformativeText:verifyError.localizedDescription ?: @"验证过程中出现错误，请重试"];
+                    [errorAlert runModal];
+                });
+                
                 NSLog(@"[BackupTask] 验证失败：%@", verifyError.localizedDescription ?: @"验证过程中出现错误");
             }
         }
         
         if (passwordErrorCount >= maxAttempts) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSAlert *finalError = [[NSAlert alloc] init];
+                [finalError setMessageText:@"密码验证失败"];
+                [finalError setInformativeText:@"已达到最大尝试次数，备份操作取消"];
+                [finalError runModal];
+            });
+            
             NSLog(@"[BackupTask] 密码验证失败：已达到最大尝试次数，备份操作取消");
             break;
         }
