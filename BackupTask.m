@@ -531,11 +531,13 @@ static void notification_cb(const char *notification, void *user_data) {
         if (!_backupPassword) {
             if (error) {
                 *error = [self errorWithCode:BackupTaskErrorCodeMissingPassword
-                                 description:@"备份已加密但未提供有效密码"];
+                                description:@"备份已加密但密码验证失败或超过最大尝试次数"];
             }
             return NO;
         }
-        // 注意：密码验证已在passwordRequestCallback内完成
+        
+        // 密码验证已在 showPasswordInputDialog 中完成
+        // 如果能走到这里，说明密码已经验证成功
     }
     
     return [self startOperationWithMode:BackupTaskModeBackup error:error];
@@ -2786,49 +2788,142 @@ static void notification_cb(const char *notification, void *user_data) {
 - (NSString *)showPasswordInputDialog:(NSString *)message isNewPassword:(BOOL)isNewPassword {
     NSLog(@"[BackupTask] 显示密码输入弹窗: %@", message);
     
-    // 使用主线程创建并显示对话框
+    static NSInteger remainingAttempts = 3;  // 设置最大尝试次数
+    if (remainingAttempts <= 0) {
+        NSLog(@"[BackupTask] 已超过最大密码尝试次数");
+        [self cleanupAfterFailedAuthentication];
+        return nil;
+    }
+    
     __block NSString *password = nil;
-    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    __block BOOL shouldRetry = NO;
     
-    dispatch_async(dispatch_get_main_queue(), ^{
-        // 创建警告框
-        NSAlert *alert = [[NSAlert alloc] init];
-        [alert setMessageText:@"备份密码"];
-        [alert setInformativeText:message ?: @"此设备启用了加密备份，请输入备份密码"];
-        [alert addButtonWithTitle:@"确定"];
-        [alert addButtonWithTitle:@"取消"];
+    do {
+        shouldRetry = NO;
+        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
         
-        // 添加密码输入框
-        NSSecureTextField *passwordField = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0, 0, 300, 24)];
-        [alert setAccessoryView:passwordField];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // 创建警告框
+            NSAlert *alert = [[NSAlert alloc] init];
+            [alert setMessageText:isNewPassword ? @"设置新的备份密码" : @"输入备份密码"];
+            
+            // 在消息中显示剩余尝试次数
+            NSString *attemptsMessage = [NSString stringWithFormat:@"%@\n\n剩余尝试次数: %ld",
+                message ?: (isNewPassword ? @"请设置新的备份密码" : @"此设备启用了加密备份，请输入备份密码"),
+                (long)remainingAttempts];
+            [alert setInformativeText:attemptsMessage];
+            [alert addButtonWithTitle:@"确定"];
+            [alert addButtonWithTitle:@"取消"];
+            
+            // 添加密码输入框
+            NSSecureTextField *passwordField = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0, 0, 300, 24)];
+            [alert setAccessoryView:passwordField];
+            
+            // 显示对话框并获取用户响应
+            [alert beginSheetModalForWindow:[[NSApplication sharedApplication] mainWindow]
+                completionHandler:^(NSModalResponse returnCode) {
+                    if (returnCode == NSAlertFirstButtonReturn) {
+                        // 用户点击确定
+                        NSString *enteredPassword = [passwordField stringValue];
+                        if ([enteredPassword length] > 0) {
+                            if (isNewPassword) {
+                                // 如果是设置新密码，直接返回
+                                password = enteredPassword;
+                            } else {
+                                // 验证输入的密码
+                                NSError *verifyError = nil;
+                                if ([self verifyBackupPasswordSecure:enteredPassword error:&verifyError]) {
+                                    NSLog(@"[BackupTask] 密码验证成功");
+                                    password = enteredPassword;
+                                } else {
+                                    remainingAttempts--;
+                                    NSLog(@"[BackupTask] 密码验证失败: %@", verifyError.localizedDescription);
+                                    NSLog(@"[BackupTask] 剩余尝试次数: %ld", (long)remainingAttempts);
+                                    
+                                    // 显示错误消息
+                                    NSAlert *errorAlert = [[NSAlert alloc] init];
+                                    [errorAlert setMessageText:@"密码错误"];
+                                    [errorAlert setInformativeText:[NSString stringWithFormat:
+                                        @"验证失败: %@\n剩余尝试次数: %ld",
+                                        verifyError.localizedDescription,
+                                        (long)remainingAttempts]];
+                                    [errorAlert runModal];
+                                    
+                                    if (remainingAttempts > 0) {
+                                        shouldRetry = YES;
+                                    } else {
+                                        // 如果没有剩余尝试次数，显示最终错误消息
+                                        NSAlert *finalAlert = [[NSAlert alloc] init];
+                                        [finalAlert setMessageText:@"备份操作已取消"];
+                                        [finalAlert setInformativeText:@"已超过最大密码尝试次数，备份操作已被中止。"];
+                                        [finalAlert setAlertStyle:NSAlertStyleCritical];
+                                        [finalAlert runModal];
+                                        
+                                        [self cleanupAfterFailedAuthentication];
+                                        password = nil;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    dispatch_semaphore_signal(semaphore);
+                }];
+            
+            // 设置输入框为第一响应者
+            [[alert.window firstResponder] resignFirstResponder];
+            [alert.window makeFirstResponder:passwordField];
+        });
         
-        // 显示对话框并获取用户响应
-        [alert beginSheetModalForWindow:[[NSApplication sharedApplication] mainWindow] completionHandler:^(NSModalResponse returnCode) {
-            if (returnCode == NSAlertFirstButtonReturn) {
-                // 用户点击确定
-                password = [passwordField stringValue];
-                if ([password length] == 0) {
-                    password = nil;
-                }
-            }
-            dispatch_semaphore_signal(semaphore);
-        }];
+        // 等待对话框完成
+        dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
         
-        // 设置输入框为第一响应者
-        [[alert.window firstResponder] resignFirstResponder];
-        [alert.window makeFirstResponder:passwordField];
-    });
+    } while (shouldRetry && remainingAttempts > 0);
     
-    // 等待对话框完成
-    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+    // 日志记录
+    if (password) {
+        NSLog(@"[BackupTask] %@ - 密码输入成功", [self formattedCurrentDate]);
+    } else {
+        NSLog(@"[BackupTask] %@ - 密码输入失败或取消", [self formattedCurrentDate]);
+    }
     
-    NSLog(@"[BackupTask] 密码输入完成: %@", password ? @"已输入" : @"未输入或取消");
     return password;
 }
 
-- (BOOL)verifyBackupPasswordSecure:(NSString *)password error:(NSError **)error {
-    NSLog(@"[BackupTask] 验证备份密码");
+
+// 用于格式化日期的辅助方法
+- (NSString *)formattedCurrentDate {
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"YYYY-MM-DD HH:mm:ss"];
+    [formatter setTimeZone:[NSTimeZone timeZoneWithAbbreviation:@"UTC"]];
+    return [formatter stringFromDate:[NSDate date]];
+}
+
+// 清理认证失败后的资源
+- (void)cleanupAfterFailedAuthentication {
+    NSLog(@"[BackupTask] 清理认证失败后的资源");
     
+    if (_mobilebackup2) {
+        // 发送失败状态
+        mobilebackup2_send_status_response(_mobilebackup2, -1, "PasswordVerificationFailed", NULL);
+    }
+    
+    // 清理所有资源
+    [self cleanupResources];
+    
+    // 重置状态
+    _backupPassword = nil;
+    _backupNewPassword = nil;
+    [self setInternalStatus:BackupTaskStatusFailed];
+    
+    // 记录失败时间
+    NSLog(@"[BackupTask] %@ - 认证失败，资源已清理",
+          [NSDate date]);
+}
+
+
+
+
+- (BOOL)verifyBackupPasswordSecure:(NSString *)password error:(NSError **)error {
     if (!password || password.length == 0) {
         if (error) {
             *error = [self errorWithCode:BackupTaskErrorCodeInvalidArg
@@ -2836,119 +2931,130 @@ static void notification_cb(const char *notification, void *user_data) {
         }
         return NO;
     }
-    
-    // 方法1: 尝试解密现有的 Manifest.db 文件
-    NSString *manifestPath = [_backupDirectory stringByAppendingPathComponent:
-                             [_deviceUDID stringByAppendingPathComponent:@"Manifest.db"]];
-    
-    if ([[NSFileManager defaultManager] fileExistsAtPath:manifestPath]) {
-        // 读取数据库头部来验证密码
-        // 第一步：加载整个文件
-        NSError *fileError = nil;
-        NSData *fileData = [NSData dataWithContentsOfFile:manifestPath options:NSDataReadingMappedIfSafe error:&fileError];
-        if (!fileData) {
-            NSLog(@"[BackupTask] 无法读取Manifest.db文件: %@", fileError);
-            return YES; // 如果无法读取文件，假设密码是正确的（保持原代码逻辑）
-        }
 
-        // 第二步：提取所需的部分（头部）
-        NSData *header = [fileData subdataWithRange:NSMakeRange(0, MIN(16, fileData.length))];
-
-        if (header) {
-            // SQLite数据库文件通常以"SQLite format 3"开头
-            NSString *headerStr = [[NSString alloc] initWithData:header encoding:NSUTF8StringEncoding];
-            if (headerStr && [headerStr hasPrefix:@"SQLite format 3"]) {
-                // 数据库未加密
-                return YES;
-            } else {
-                // 数据库可能已加密，但我们没有实际解密逻辑
-                // 这里我们只能假设密码正确，因为真正的验证需要SQLCipher支持
-                return YES;
-            }
-        }
-    }
+    NSLog(@"[BackupTask] 开始验证备份密码");
     
-    // 方法2: 向设备发送带密码的测试请求
-    plist_t opts = plist_new_dict();
-    plist_dict_set_item(opts, "Password", plist_new_string([password UTF8String]));
+    // 创建密码验证请求
+    plist_t dict = plist_new_dict();
+    plist_dict_set_item(dict, "Password", plist_new_string([password UTF8String]));
+    // 添加必要的验证选项
+    plist_dict_set_item(dict, "VerifyPassword", plist_new_bool(1));
     
-    BOOL passwordValid = NO;
+    // 使用 DLMessageProcessMessage 而不是直接的 Backup 命令
+    mobilebackup2_error_t err = mobilebackup2_send_message(_mobilebackup2, "DLMessageProcessMessage", dict);
+    plist_free(dict);
     
-    // 发送一个简单的请求
-    mobilebackup2_error_t err = mobilebackup2_send_request(_mobilebackup2, "Info",
-                                                          [_deviceUDID UTF8String],
-                                                          [_sourceUDID UTF8String],
-                                                          opts);
-    plist_free(opts);
-    
-    if (err == MOBILEBACKUP2_E_SUCCESS) {
-        // 如果请求成功发送，尝试接收响应
-        plist_t response = NULL;
-        char *dlmsg = NULL;
-        err = mobilebackup2_receive_message(_mobilebackup2, &response, &dlmsg);
-        
-        // 分析响应以检查是否有密码错误
-        if (err == MOBILEBACKUP2_E_SUCCESS && response) {
-            if (dlmsg && strcmp(dlmsg, "DLMessageProcessMessage") == 0) {
-                plist_t dict = plist_array_get_item(response, 1);
-                if (dict && plist_get_node_type(dict) == PLIST_DICT) {
-                    plist_t error_code_node = plist_dict_get_item(dict, "ErrorCode");
-                    if (error_code_node) {
-                        uint64_t error_code = 0;
-                        plist_get_uint_val(error_code_node, &error_code);
-                        
-                        // 密码错误通常有特定的错误代码
-                        if (error_code != 0) {
-                            NSLog(@"[BackupTask] Password error detected: %llu", error_code);
-                            passwordValid = NO;
-                            
-                            // 提取错误描述
-                            plist_t error_desc_node = plist_dict_get_item(dict, "ErrorDescription");
-                            if (error_desc_node && plist_get_node_type(error_desc_node) == PLIST_STRING) {
-                                char *err_desc = NULL;
-                                plist_get_string_val(error_desc_node, &err_desc);
-                                if (err_desc) {
-                                    if (error) {
-                                        *error = [self errorWithCode:BackupTaskErrorCodeWrongPassword
-                                                         description:[NSString stringWithUTF8String:err_desc]];
-                                    }
-                                    free(err_desc);
-                                }
-                            } else if (error) {
-                                *error = [self errorWithCode:BackupTaskErrorCodeWrongPassword
-                                                 description:@"密码验证失败"];
-                            }
-                        } else {
-                            passwordValid = YES;
-                        }
-                    }
-                }
-            } else {
-                // 如果收到的不是错误消息，密码可能是正确的
-                passwordValid = YES;
-            }
-            
-            plist_free(response);
-        }
-        
-        if (dlmsg) free(dlmsg);
-    } else {
-        // 请求发送失败
+    if (err != MOBILEBACKUP2_E_SUCCESS) {
+        NSLog(@"[BackupTask] 发送密码验证请求失败: %d", err);
         if (error) {
             *error = [self errorWithCode:BackupTaskErrorCodeProtocolError
-                             description:@"无法验证密码：通信错误"];
+                             description:@"发送密码验证请求失败"];
         }
         return NO;
     }
-    
-    if (passwordValid) {
-        NSLog(@"[BackupTask] 密码验证成功");
-    } else {
-        NSLog(@"[BackupTask] 密码验证失败");
+
+    // 设置接收超时
+    dispatch_semaphore_t timeout_semaphore = dispatch_semaphore_create(0);
+    __block BOOL timeoutOccurred = NO;
+    __block BOOL passwordValid = NO;
+    __block NSError *responseError = nil;
+
+    // 在后台线程处理响应
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        // 接收响应
+        plist_t response = NULL;
+        mobilebackup2_error_t receive_err = mobilebackup2_receive_message(_mobilebackup2, NULL, &response);
+        
+        if (receive_err != MOBILEBACKUP2_E_SUCCESS || !response) {
+            NSLog(@"[BackupTask] 接收密码验证响应失败: %d", receive_err);
+            responseError = [self errorWithCode:BackupTaskErrorCodeProtocolError
+                                  description:@"接收密码验证响应失败"];
+        } else {
+            // 检查错误码
+            plist_t errorNode = plist_dict_get_item(response, "ErrorCode");
+            if (errorNode && (plist_get_node_type(errorNode) == PLIST_UINT)) {
+                uint64_t errorCode = 0;
+                plist_get_uint_val(errorNode, &errorCode);
+                
+                if (errorCode == 0) {
+                    passwordValid = YES;
+                    NSLog(@"[BackupTask] 密码验证成功");
+                } else {
+                    // 处理具体的错误码
+                    NSString *errorDescription = nil;
+                    plist_t descNode = plist_dict_get_item(response, "ErrorDescription");
+                    if (descNode && (plist_get_node_type(descNode) == PLIST_STRING)) {
+                        char *desc = NULL;
+                        plist_get_string_val(descNode, &desc);
+                        if (desc) {
+                            errorDescription = [NSString stringWithUTF8String:desc];
+                            free(desc);
+                        }
+                    }
+                    
+                    NSLog(@"[BackupTask] 密码验证失败: %@", errorDescription ?: @"未知错误");
+                    responseError = [self errorWithCode:BackupTaskErrorCodeWrongPassword
+                                         description:errorDescription ?: @"密码验证失败"];
+                }
+            }
+            
+            if (response) {
+                plist_free(response);
+            }
+        }
+        
+        dispatch_semaphore_signal(timeout_semaphore);
+    });
+
+    // 等待响应，设置5秒超时
+    const dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC));
+    timeoutOccurred = (dispatch_semaphore_wait(timeout_semaphore, timeout) != 0);
+
+    if (timeoutOccurred) {
+        NSLog(@"[BackupTask] 密码验证超时");
+        if (error) {
+            *error = [self errorWithCode:BackupTaskErrorCodeTimeoutError
+                             description:@"密码验证超时"];
+        }
+        return NO;
     }
-    
+
+    if (responseError && error) {
+        *error = responseError;
+    }
+
+    NSLog(@"[BackupTask] 密码验证完成: %@", passwordValid ? @"成功" : @"失败");
     return passwordValid;
 }
+
+- (void)handleAuthenticationStatus:(uint64_t)errorCode error:(NSError **)error {
+    switch(errorCode) {
+        case 0:
+            // 成功
+            break;
+        case 45: // 设备锁定
+            if (error) {
+                *error = [self errorWithCode:BackupTaskErrorCodeDeviceLocked
+                                description:@"设备已锁定，请先解锁设备"];
+            }
+            break;
+        case 49: // 备份加密
+            if (error) {
+                *error = [self errorWithCode:BackupTaskErrorCodeAuthenticationRequired
+                                description:@"需要备份密码"];
+            }
+            break;
+        default:
+            if (error) {
+                *error = [self errorWithCode:BackupTaskErrorCodeProtocolError
+                                description:[NSString stringWithFormat:@"未知错误码: %llu", errorCode]];
+            }
+            break;
+    }
+}
+
+
+
 
 #pragma mark - 文件处理方法
 
