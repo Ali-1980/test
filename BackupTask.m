@@ -2922,7 +2922,6 @@ static void notification_cb(const char *notification, void *user_data) {
 
 
 
-
 - (BOOL)verifyBackupPasswordSecure:(NSString *)password error:(NSError **)error {
     if (!password || password.length == 0) {
         if (error) {
@@ -2932,16 +2931,61 @@ static void notification_cb(const char *notification, void *user_data) {
         return NO;
     }
 
-    NSLog(@"[BackupTask] 开始验证备份密码");
+    NSLog(@"[BackupTask] 开始验证备份密码 - %@", [self formattedCurrentDate]);
+
+    // 步骤1: 发送 Hello 消息进行握手
+    plist_t hello_dict = plist_new_dict();
+    plist_t versions = plist_new_array();
+    plist_array_append_item(versions, plist_new_real(2.0));
+    plist_dict_set_item(hello_dict, "SupportedProtocolVersions", versions);
     
-    // 创建密码验证请求
+    mobilebackup2_error_t err = mobilebackup2_send_message(_mobilebackup2, "Hello", hello_dict);
+    plist_free(hello_dict);
+    
+    if (err != MOBILEBACKUP2_E_SUCCESS) {
+        NSLog(@"[BackupTask] Hello 消息发送失败: %d", err);
+        if (error) {
+            *error = [self errorWithCode:BackupTaskErrorCodeProtocolError
+                             description:@"协议握手失败"];
+        }
+        return NO;
+    }
+
+    // 接收 Hello 响应
+    plist_t hello_response_plist = NULL;
+    err = mobilebackup2_receive_message(_mobilebackup2, &hello_response_plist, NULL);
+    if (err != MOBILEBACKUP2_E_SUCCESS || !hello_response_plist) {
+        NSLog(@"[BackupTask] Hello 响应接收失败: %d", err);
+        if (error) {
+            *error = [self errorWithCode:BackupTaskErrorCodeProtocolError
+                             description:@"无法接收设备响应"];
+        }
+        return NO;
+    }
+    
+    if (hello_response_plist) {
+        char *xml_response = NULL;
+        uint32_t xml_length = 0;
+        plist_to_xml(hello_response_plist, &xml_response, &xml_length);
+        if (xml_response) {
+            NSLog(@"[BackupTask] Hello 响应内容: %s", xml_response);
+            free(xml_response);
+        }
+        plist_free(hello_response_plist);
+    }
+
+    // 步骤2: 发送密码验证请求
     plist_t dict = plist_new_dict();
-    plist_dict_set_item(dict, "Password", plist_new_string([password UTF8String]));
-    // 添加必要的验证选项
-    plist_dict_set_item(dict, "VerifyPassword", plist_new_bool(1));
+    // 设置目标标识符（设备 UDID）
+    plist_dict_set_item(dict, "TargetIdentifier", plist_new_string([_deviceUDID UTF8String]));
     
-    // 使用 DLMessageProcessMessage 而不是直接的 Backup 命令
-    mobilebackup2_error_t err = mobilebackup2_send_message(_mobilebackup2, "DLMessageProcessMessage", dict);
+    // 创建选项字典
+    plist_t opts = plist_new_dict();
+    plist_dict_set_item(opts, "Password", plist_new_string([password UTF8String]));
+    plist_dict_set_item(dict, "Options", opts);
+    
+    // 发送验证请求
+    err = mobilebackup2_send_message(_mobilebackup2, "CheckPassword", dict);
     plist_free(dict);
     
     if (err != MOBILEBACKUP2_E_SUCCESS) {
@@ -2953,79 +2997,74 @@ static void notification_cb(const char *notification, void *user_data) {
         return NO;
     }
 
-    // 设置接收超时
-    dispatch_semaphore_t timeout_semaphore = dispatch_semaphore_create(0);
-    __block BOOL timeoutOccurred = NO;
-    __block BOOL passwordValid = NO;
-    __block NSError *responseError = nil;
-
-    // 在后台线程处理响应
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        // 接收响应
-        plist_t response = NULL;
-        mobilebackup2_error_t receive_err = mobilebackup2_receive_message(_mobilebackup2, NULL, &response);
-        
-        if (receive_err != MOBILEBACKUP2_E_SUCCESS || !response) {
-            NSLog(@"[BackupTask] 接收密码验证响应失败: %d", receive_err);
-            responseError = [self errorWithCode:BackupTaskErrorCodeProtocolError
-                                  description:@"接收密码验证响应失败"];
-        } else {
-            // 检查错误码
-            plist_t errorNode = plist_dict_get_item(response, "ErrorCode");
-            if (errorNode && (plist_get_node_type(errorNode) == PLIST_UINT)) {
-                uint64_t errorCode = 0;
-                plist_get_uint_val(errorNode, &errorCode);
-                
-                if (errorCode == 0) {
-                    passwordValid = YES;
-                    NSLog(@"[BackupTask] 密码验证成功");
-                } else {
-                    // 处理具体的错误码
-                    NSString *errorDescription = nil;
-                    plist_t descNode = plist_dict_get_item(response, "ErrorDescription");
-                    if (descNode && (plist_get_node_type(descNode) == PLIST_STRING)) {
-                        char *desc = NULL;
-                        plist_get_string_val(descNode, &desc);
-                        if (desc) {
-                            errorDescription = [NSString stringWithUTF8String:desc];
-                            free(desc);
-                        }
-                    }
-                    
-                    NSLog(@"[BackupTask] 密码验证失败: %@", errorDescription ?: @"未知错误");
-                    responseError = [self errorWithCode:BackupTaskErrorCodeWrongPassword
-                                         description:errorDescription ?: @"密码验证失败"];
-                }
-            }
-            
-            if (response) {
-                plist_free(response);
-            }
-        }
-        
-        dispatch_semaphore_signal(timeout_semaphore);
-    });
-
-    // 等待响应，设置5秒超时
-    const dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC));
-    timeoutOccurred = (dispatch_semaphore_wait(timeout_semaphore, timeout) != 0);
-
-    if (timeoutOccurred) {
-        NSLog(@"[BackupTask] 密码验证超时");
+    // 接收验证响应
+    plist_t response_plist = NULL;
+    err = mobilebackup2_receive_message(_mobilebackup2, &response_plist, NULL);
+    if (err != MOBILEBACKUP2_E_SUCCESS || !response_plist) {
+        NSLog(@"[BackupTask] 接收密码验证响应失败: %d", err);
         if (error) {
-            *error = [self errorWithCode:BackupTaskErrorCodeTimeoutError
-                             description:@"密码验证超时"];
+            *error = [self errorWithCode:BackupTaskErrorCodeProtocolError
+                             description:@"接收密码验证响应失败"];
         }
         return NO;
     }
 
-    if (responseError && error) {
-        *error = responseError;
+    // 将响应转换为 XML 并打印（用于调试）
+    char *xml_response = NULL;
+    uint32_t xml_length = 0;
+    plist_to_xml(response_plist, &xml_response, &xml_length);
+    if (xml_response) {
+        NSLog(@"[BackupTask] 验证响应内容: %s", xml_response);
+        free(xml_response);
     }
 
-    NSLog(@"[BackupTask] 密码验证完成: %@", passwordValid ? @"成功" : @"失败");
+    // 检查响应中的错误码
+    BOOL passwordValid = NO;
+    plist_t node = plist_dict_get_item(response_plist, "ErrorCode");
+    if (node && (plist_get_node_type(node) == PLIST_UINT)) {
+        uint64_t errorCode = 0;
+        plist_get_uint_val(node, &errorCode);
+        
+        NSLog(@"[BackupTask] 收到错误码: %llu", errorCode);
+        
+        if (errorCode == 0) {
+            passwordValid = YES;
+            NSLog(@"[BackupTask] 密码验证成功");
+        } else {
+            // 获取错误描述
+            NSString *errorDescription = nil;
+            plist_t descNode = plist_dict_get_item(response_plist, "ErrorDescription");
+            if (descNode && (plist_get_node_type(descNode) == PLIST_STRING)) {
+                char *desc = NULL;
+                plist_get_string_val(descNode, &desc);
+                if (desc) {
+                    errorDescription = [NSString stringWithUTF8String:desc];
+                    free(desc);
+                }
+            }
+            
+            NSLog(@"[BackupTask] 密码验证失败: %@", errorDescription ?: @"未知错误");
+            if (error) {
+                *error = [self errorWithCode:BackupTaskErrorCodeWrongPassword
+                                description:errorDescription ?: @"密码验证失败"];
+            }
+        }
+    }
+
+    if (response_plist) {
+        plist_free(response_plist);
+    }
+
+    // 发送验证完成的状态响应
+    if (passwordValid) {
+        mobilebackup2_send_status_response(_mobilebackup2, 0, "PasswordVerified", NULL);
+    }
+
+    NSLog(@"[BackupTask] 密码验证过程完成 - %@", [self formattedCurrentDate]);
     return passwordValid;
 }
+
+
 
 - (void)handleAuthenticationStatus:(uint64_t)errorCode error:(NSError **)error {
     switch(errorCode) {
@@ -5732,3 +5771,286 @@ static void remove_file(const char *path) {
 
 @end
 
+//
+//  BackupTask.h
+//  iOSBackupManager
+//
+//  Created based on libimobiledevice
+//
+
+#import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+// 定义常量
+extern NSString * const kBackupTaskErrorDomain;
+extern NSString * const kNPSyncWillStart;
+extern NSString * const kNPSyncLockRequest;
+extern NSString * const kNPSyncDidStart;
+extern NSString * const kNPSyncCancelRequest;
+extern NSString * const kNPBackupDomainChanged;
+
+// 锁定尝试配置
+extern const int kLockAttempts;
+extern const int kLockWaitMicroseconds;
+
+// 操作模式枚举
+typedef NS_ENUM(NSInteger, BackupTaskMode) {
+    BackupTaskModeBackup,     // 创建备份
+    BackupTaskModeRestore,    // 恢复备份
+    BackupTaskModeInfo,       // 查询备份信息
+    BackupTaskModeList,       // 列出备份文件
+    BackupTaskModeUnback,     // 解包备份
+    BackupTaskModeChangePw,   // 修改备份密码
+    BackupTaskModeErase,      // 擦除设备
+    BackupTaskModeCloud       // 云备份控制
+};
+
+// 操作状态枚举
+typedef NS_ENUM(NSInteger, BackupTaskStatus) {
+    BackupTaskStatusIdle,        // 空闲
+    BackupTaskStatusConnecting,  // 正在连接设备
+    BackupTaskStatusPreparing,   // 准备中
+    BackupTaskStatusProcessing,  // 处理中
+    BackupTaskStatusCompleted,   // 已完成
+    BackupTaskStatusFailed,      // 失败
+    BackupTaskStatusCancelled    // 已取消
+};
+
+// 备份操作标志
+typedef NS_OPTIONS(NSUInteger, BackupTaskOptions) {
+    // 恢复选项
+    BackupTaskOptionRestoreSystemFiles  = 1 << 0,  // 包括系统文件
+    BackupTaskOptionRestoreNoReboot     = 1 << 1,  // 恢复后不重启
+    BackupTaskOptionRestoreCopyBackup   = 1 << 2,  // 创建备份副本
+    BackupTaskOptionRestoreSettings     = 1 << 3,  // 恢复设备设置
+    BackupTaskOptionRestoreRemoveItems  = 1 << 4,  // 移除未恢复的项目
+    BackupTaskOptionRestoreSkipApps     = 1 << 5,  // 跳过应用程序恢复
+    
+    // 加密选项
+    BackupTaskOptionEncryptionEnable    = 1 << 6,  // 启用加密
+    BackupTaskOptionEncryptionDisable   = 1 << 7,  // 禁用加密
+    BackupTaskOptionEncryptionChangePw  = 1 << 8,  // 修改密码
+    
+    // 备份选项
+    BackupTaskOptionForceFullBackup     = 1 << 9,  // 强制完整备份
+    
+    // 云备份选项
+    BackupTaskOptionCloudEnable         = 1 << 10, // 启用云备份
+    BackupTaskOptionCloudDisable        = 1 << 11, // 禁用云备份
+    
+    // 新增: 保留现有备份选项
+    BackupTaskOptionPreserveExistingBackup = 1 << 12  // 保留现有备份数据
+    
+};
+
+// 错误码定义
+typedef NS_ENUM(NSInteger, BackupTaskErrorCode) {
+    BackupTaskErrorCodeUnknown = -1,
+    BackupTaskErrorCodeSuccess = 0,
+    BackupTaskErrorCodeInvalidArg = 1,
+    BackupTaskErrorCodeConnectionFailed = 2,
+    BackupTaskErrorCodeOperationFailed = 3,
+    BackupTaskErrorCodeAlreadyRunning = 4,
+    BackupTaskErrorCodeDeviceNotFound = 5,
+    BackupTaskErrorCodeInvalidBackupDirectory = 6,
+    BackupTaskErrorCodeMissingPassword = 7,
+    BackupTaskErrorCodeWrongPassword = 8,
+    BackupTaskErrorCodeServiceStartFailed = 9,
+    BackupTaskErrorCodeProtocolError = 10,
+    BackupTaskErrorCodeDeviceDisconnected = 11,
+    BackupTaskErrorCodeBackupFailed = 12,
+    BackupTaskErrorCodeRestoreFailed = 13,
+    BackupTaskErrorCodeUserCancelled = 14,
+    BackupTaskErrorCodeOutOfDiskSpace = 15,  // 新增：磁盘空间不足
+    BackupTaskErrorCodeIOError = 16,         // 新增：I/O错误
+    BackupTaskErrorCodeTimeoutError = 17,       // 新增：操作超时
+    BackupTaskErrorCodeProtocolVersionMismatch = 18,  // 协议版本不匹配
+    BackupTaskErrorCodeDeviceLocked = 19,            // 设备已锁定
+    BackupTaskErrorCodeBackupInProgress = 20,        // 备份已在进行
+    BackupTaskErrorCodeNetworkError = 21,            // 网络错误
+    BackupTaskErrorCodeAuthenticationRequired = 22    // 需要认证
+};
+
+// 备份文件信息类
+@interface BackupFileInfo : NSObject
+@property (nonatomic, strong) NSString *path;
+@property (nonatomic, strong) NSString *fileType;
+@property (nonatomic, assign) uint64_t fileSize;
+@property (nonatomic, strong) NSDate *modificationDate;
+@end
+
+// 备份任务类
+@interface BackupTask : NSObject
+
+#pragma mark - 初始化方法
+/**
+ * 获取BackupTask实例（线程安全的单例）
+ */
++ (instancetype)sharedInstance;
+
+/**
+ * 使用指定设置自定义初始化备份任务
+ * @param backupDirectory 备份目录
+ * @param useNetwork 是否使用网络连接
+ * @return 备份任务实例
+ */
+- (instancetype)initWithBackupDirectory:(NSString *)backupDirectory
+                             useNetwork:(BOOL)useNetwork NS_DESIGNATED_INITIALIZER;
+
+#pragma mark - 属性
+// 基本设置
+@property (nonatomic, strong) NSString *backupDirectory;  // 备份目录路径
+@property (nonatomic, strong) NSString *deviceUDID;       // 设备UDID
+@property (nonatomic, strong) NSString *sourceUDID;       // 源备份UDID(用于不同设备恢复)
+
+// 连接设置
+@property (nonatomic, assign) BOOL useNetwork;            // 使用网络连接
+@property (nonatomic, assign) BOOL interactiveMode;       // 交互模式(密码)
+
+// 安全设置
+@property (nonatomic, strong, nullable) NSString *backupPassword;    // 备份密码
+@property (nonatomic, strong, nullable) NSString *backupNewPassword; // 新备份密码(更改密码时)
+
+// 操作选项
+@property (nonatomic, assign) BackupTaskOptions options;  // 操作标志
+
+// 状态信息 (只读)
+@property (atomic, readonly) BackupTaskStatus status;     // 当前状态
+@property (atomic, readonly) float progress;              // 当前进度(0-100)
+@property (atomic, readonly, nullable) NSError *lastError;// 最近错误
+
+// 备份大小信息 (只读)
+@property (atomic, readonly) uint64_t estimatedBackupSize;// 估计的备份大小(字节)
+@property (atomic, readonly) uint64_t actualBackupSize;   // 实际备份大小(字节)
+
+// 备份加密状态 (只读)
+@property (atomic, readonly) BOOL isBackupEncrypted;      // 备份是否加密
+
+#pragma mark - 回调块定义
+// 进度回调
+@property (nonatomic, copy, nullable) void (^progressCallback)(float progress, NSString *currentOperation, uint64_t currentBytes, uint64_t totalBytes);
+
+// 状态更新回调
+@property (nonatomic, copy, nullable) void (^statusCallback)(BackupTaskStatus status, NSString *statusDescription);
+
+// 完成回调
+@property (nonatomic, copy, nullable) void (^completionCallback)(BOOL success, BackupTaskMode mode, NSError * _Nullable error);
+
+// 密码请求回调(交互模式)
+@property (nonatomic, copy, nullable) NSString* _Nullable (^passwordRequestCallback)(NSString *message, BOOL verifyInput);
+
+// 设备确认回调(设备请求输入密码等)
+@property (nonatomic, copy, nullable) void (^deviceConfirmationCallback)(NSString *confirmationType);
+
+#pragma mark - 便捷操作方法
+/**
+ * 使用简化参数开始备份
+ * @param deviceUDID 设备UDID
+ * @param progressBlock 进度回调
+ * @param completionBlock 完成回调
+ */
+- (void)startBackupForDevice:(NSString *)deviceUDID
+                    progress:(void (^)(double progress, NSString *message))progressBlock
+                  completion:(void (^)(BOOL success, NSError * _Nullable error))completionBlock;
+
+/**
+ * 开始指定模式的操作
+ * @param mode 操作模式
+ * @param error 错误信息
+ * @return 操作是否成功启动
+ */
+- (BOOL)startOperationWithMode:(BackupTaskMode)mode error:(NSError **)error;
+
+/**
+ * 取消当前正在进行的操作
+ */
+- (void)cancelOperation;
+
+/**
+ * 清理备份任务使用的所有资源
+ * 应在完成后或不再需要时调用
+ */
+- (void)cleanupResources;
+
+#pragma mark - 核心功能方法
+// 备份方法
+- (BOOL)startBackup:(NSError **)error;
+
+// 恢复方法
+- (BOOL)startRestore:(NSError **)error;
+
+// 获取备份信息
+- (nullable NSDictionary *)getBackupInfo:(NSError **)error;
+
+// 列出备份文件
+- (nullable NSArray<BackupFileInfo *> *)listBackupFiles:(NSString *)path error:(NSError **)error;
+
+// 解包备份
+- (BOOL)unpackBackup:(NSError **)error;
+
+// 擦除设备
+- (BOOL)eraseDevice:(NSError **)error;
+
+// 设置备份加密
+- (BOOL)setBackupEncryption:(BOOL)enable password:(nullable NSString *)password error:(NSError **)error;
+
+// 更改备份密码
+- (BOOL)changeBackupPassword:(nullable NSString *)oldPassword newPassword:(nullable NSString *)newPassword error:(NSError **)error;
+
+// 设置云备份
+- (BOOL)setCloudBackup:(BOOL)enable error:(NSError **)error;
+
+#pragma mark - 备份状态检查与管理
+
+/**
+ * 检查备份密码是否正确
+ * @param password 要验证的密码
+ * @param error 错误信息
+ * @return 密码是否正确
+ */
+- (BOOL)verifyBackupPassword:(NSString *)password error:(NSError **)error;
+
+/**
+ * 检查是否有足够的磁盘空间进行备份
+ * @param requiredSpace 所需空间（字节）
+ * @param error 错误信息
+ * @return 是否有足够空间
+ */
+- (BOOL)checkDiskSpace:(uint64_t)requiredSpace error:(NSError **)error;
+
+/**
+ * 验证备份目录是否有效
+ * @param backupPath 备份路径
+ * @param error 错误信息
+ * @return 备份目录是否有效
+ */
+- (BOOL)validateBackupDirectory:(NSString *)backupPath error:(NSError **)error;
+
+/**
+ * 验证备份状态文件是否有指定状态
+ * @param statusPath 状态文件路径
+ * @param state 要验证的状态值
+ * @param error 错误信息
+ * @return 是否匹配指定状态
+ */
+- (BOOL)validateBackupStatus:(NSString *)statusPath state:(NSString *)state error:(NSError **)error;
+
+/**
+ * 获取格式化的备份大小字符串
+ * @param size 备份大小（字节）
+ * @return 格式化的大小字符串
+ */
+- (NSString *)formatSize:(uint64_t)size;
+
+/**
+ * 提取备份信息
+ * @param udid 设备UDID
+ * @return 备份信息字典
+ */
+- (NSDictionary *)extractBackupInfo:(NSString *)udid;
+
+@end
+
+NS_ASSUME_NONNULL_END
