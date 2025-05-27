@@ -1,6 +1,5 @@
 //
 //  DeviceBackupRestore.m
-
 //
 //  Created by Monterey on 19/1/2025.
 //
@@ -722,96 +721,125 @@
 - (void)showDataTypeSelectionDialog:(BackupDataType)supportedTypes {
     NSLog(@"DeviceBackupRestore: 显示数据类型选择对话框，支持的类型: %lu", (unsigned long)supportedTypes);
     
-    // ✅ 先清理之前的窗口，避免重复创建
-    if (self.dataTypeSelectionWindow) {
-        [self.dataTypeSelectionWindow close];
-        self.dataTypeSelectionWindow = nil;
-        self.dataTypeCheckboxes = nil;
+    @autoreleasepool {
+        // 1. 在主线程执行所有 UI 操作
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // 2. 安全地清理现有窗口
+            if (self.dataTypeSelectionWindow) {
+                // 保存临时引用
+                NSWindow *oldWindow = self.dataTypeSelectionWindow;
+                // 清除代理
+                oldWindow.delegate = nil;
+                // 清除属性
+                self.dataTypeSelectionWindow = nil;
+                self.dataTypeCheckboxes = nil;
+                // 关闭窗口
+                [oldWindow close];
+            }
+            
+            // 3. 创建新窗口
+            NSWindow *selectionWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 500, 600)
+                                                                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                                                                    backing:NSBackingStoreBuffered
+                                                                      defer:NO];
+            
+            // 4. 配置窗口基本属性
+            [selectionWindow setReleasedWhenClosed:NO];
+            
+            // 5. 设置窗口标题
+            NSString *windowTitle = [[LanguageManager sharedManager] localizedStringForKeys:@"SelectiveBackupTitle"
+                                                                                inModule:@"Backup"
+                                                                            defaultValue:@"选择备份数据类型"];
+            [selectionWindow setTitle:windowTitle];
+            [selectionWindow center];
+            
+            // 6. 创建和配置内容视图
+            NSView *contentView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 500, 600)];
+            [selectionWindow setContentView:contentView];
+            
+            // 7. 创建和配置滚动视图
+            NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(20, 80, 460, 450)];
+            [scrollView setHasVerticalScroller:YES];
+            [scrollView setHasHorizontalScroller:NO];
+            [scrollView setBorderType:NSBezelBorder];
+            [contentView addSubview:scrollView];
+            
+            // 8. 创建文档视图
+            NSView *documentView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 440, 400)];
+            [scrollView setDocumentView:documentView];
+            
+            // 9. 创建复选框数组
+            NSMutableArray *checkboxes = [NSMutableArray array];
+            NSMutableArray *dataTypes = [NSMutableArray array];
+            
+            // 10. 创建和配置说明标签
+            NSTextField *instructionLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(20, 520, 460, 60)];
+            [instructionLabel setStringValue:[[LanguageManager sharedManager] localizedStringForKeys:@"SelectiveBackupInstruction"
+                                                                                         inModule:@"Backup"
+                                                                                    defaultValue:@"请选择要备份的数据类型。只有支持的数据类型会被显示。"]];
+            [self configureInstructionLabel:instructionLabel];
+            [contentView addSubview:instructionLabel];
+            
+            // 11. 创建复选框
+            CGFloat yPosition = [self createCheckboxesInView:documentView
+                                              withDataTypes:[BackupOptionTask getAllAvailableDataTypes]
+                                           supportedTypes:supportedTypes
+                                              checkboxes:checkboxes
+                                              dataTypes:dataTypes];
+            
+            // 12. 调整文档视图大小
+            CGFloat totalHeight = MAX((checkboxes.count * 40) + 50, 400);
+            [documentView setFrame:NSMakeRect(0, 0, 440, totalHeight)];
+            
+            // 13. 创建控制按钮
+            [self createControlButtonsInView:contentView];
+            
+            // 14. 保存引用（确保在设置代理之前）
+            self.dataTypeCheckboxes = [checkboxes copy];
+            self.dataTypeSelectionWindow = selectionWindow;
+            self.supportedDataTypes = supportedTypes;
+            
+            // 15. 最后设置代理
+            selectionWindow.delegate = self;
+            
+            // 16. 显示窗口（只调用一次）
+            [selectionWindow makeKeyAndOrderFront:nil];
+        });
     }
-    
-    
-    // 创建主窗口
-    NSWindow *selectionWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 500, 600)
-                                                           styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
-                                                             backing:NSBackingStoreBuffered
-                                                               defer:NO];
-    
-    // ✅ 设置窗口代理以处理关闭事件
-     self.dataTypeSelectionWindow.delegate = (id<NSWindowDelegate>)self;
-    
-    // 设置窗口标题
-    NSString *windowTitle = [[LanguageManager sharedManager] localizedStringForKeys:@"SelectiveBackupTitle"
-                                                                           inModule:@"Backup"
-                                                                       defaultValue:@"选择备份数据类型"];
-    [selectionWindow setTitle:windowTitle];
-    [selectionWindow center];
-    
-    // 创建主容器视图
-    NSView *contentView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 500, 600)];
-    [selectionWindow setContentView:contentView];
-    
-    // 创建滚动视图来容纳复选框
-    NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(20, 80, 460, 450)];
-    [scrollView setHasVerticalScroller:YES];
-    [scrollView setHasHorizontalScroller:NO];
-    [scrollView setBorderType:NSBezelBorder];
-    [contentView addSubview:scrollView];
-    
-    // 创建文档视图
-    NSView *documentView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 440, 400)];
-    [scrollView setDocumentView:documentView];
-    
-    // 创建数据类型复选框数组
-    NSMutableArray *checkboxes = [NSMutableArray array];
-    NSMutableArray *dataTypes = [NSMutableArray array];
-    
-    // 获取支持的数据类型列表
-    NSArray<NSNumber *> *allDataTypes = [BackupOptionTask getAllAvailableDataTypes];
-    
-    CGFloat yPosition = 350; // 从顶部开始
+}
+
+#pragma mark - Helper Methods
+
+- (void)configureInstructionLabel:(NSTextField *)label {
+    [label setBezeled:NO];
+    [label setDrawsBackground:NO];
+    [label setEditable:NO];
+    [label setSelectable:NO];
+    [label setFont:[NSFont systemFontOfSize:13]];
+    [label setTextColor:[NSColor secondaryLabelColor]];
+    [label setLineBreakMode:NSLineBreakByWordWrapping];
+    NSTextFieldCell *cell = [[NSTextFieldCell alloc] init];
+    [cell setWraps:YES];
+    [label setCell:cell];
+}
+
+- (CGFloat)createCheckboxesInView:(NSView *)documentView
+                   withDataTypes:(NSArray<NSNumber *> *)allDataTypes
+                supportedTypes:(BackupDataType)supportedTypes
+                   checkboxes:(NSMutableArray *)checkboxes
+                   dataTypes:(NSMutableArray *)dataTypes {
+    CGFloat yPosition = 350;
     CGFloat checkboxHeight = 30;
     CGFloat padding = 10;
     
-    // 添加说明标签
-    NSTextField *instructionLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(20, 520, 460, 60)];
-    [instructionLabel setStringValue:[[LanguageManager sharedManager] localizedStringForKeys:@"SelectiveBackupInstruction"
-                                                                                   inModule:@"Backup"
-                                                                              defaultValue:@"请选择要备份的数据类型。只有支持的数据类型会被显示。"]];
-    [instructionLabel setBezeled:NO];
-    [instructionLabel setDrawsBackground:NO];
-    [instructionLabel setEditable:NO];
-    [instructionLabel setSelectable:NO];
-    [instructionLabel setFont:[NSFont systemFontOfSize:13]];
-    [instructionLabel setTextColor:[NSColor secondaryLabelColor]];
-    [instructionLabel setLineBreakMode:NSLineBreakByWordWrapping];
-    [instructionLabel setCell:[[NSTextFieldCell alloc] init]];
-    [[instructionLabel cell] setWraps:YES];
-    [contentView addSubview:instructionLabel];
-    
-    // 遍历所有数据类型，只显示支持的类型
     for (NSNumber *dataTypeNum in allDataTypes) {
         BackupDataType dataType = [dataTypeNum unsignedIntegerValue];
-        
-        // 检查当前数据类型是否被支持
         if (!(supportedTypes & dataType)) {
-            continue; // 跳过不支持的数据类型
+            continue;
         }
         
-        // 创建复选框
-        NSButton *checkbox = [[NSButton alloc] initWithFrame:NSMakeRect(20, yPosition, 400, checkboxHeight)];
-        [checkbox setButtonType:NSButtonTypeSwitch];
-        [checkbox setState:NSControlStateValueOff]; // 默认不选中
-        
-        // 获取本地化的数据类型名称
-        NSString *localizedName = [self getLocalizedDataTypeName:dataType];
-        [checkbox setTitle:localizedName];
-        [checkbox setFont:[NSFont systemFontOfSize:14]];
-        
-        // 设置标签和目标动作
-        [checkbox setTag:dataType];
-        [checkbox setTarget:self];
-        [checkbox setAction:@selector(dataTypeCheckboxChanged:)];
-        
+        NSButton *checkbox = [self createCheckboxWithFrame:NSMakeRect(20, yPosition, 400, checkboxHeight)
+                                               dataType:dataType];
         [documentView addSubview:checkbox];
         [checkboxes addObject:checkbox];
         [dataTypes addObject:dataTypeNum];
@@ -819,72 +847,68 @@
         yPosition -= (checkboxHeight + padding);
     }
     
-    // 调整文档视图高度
-    CGFloat totalHeight = (checkboxes.count * (checkboxHeight + padding)) + 50;
-    [documentView setFrame:NSMakeRect(0, 0, 440, MAX(totalHeight, 400))];
-    
-    // 添加全选/全不选按钮
-    NSButton *selectAllButton = [[NSButton alloc] initWithFrame:NSMakeRect(20, 45, 100, 30)];
-    [selectAllButton setTitle:[[LanguageManager sharedManager] localizedStringForKeys:@"SelectAll"
-                                                                            inModule:@"Backup"
-                                                                        defaultValue:@"全选"]];
-    [selectAllButton setTarget:self];
-    [selectAllButton setAction:@selector(selectAllDataTypes:)];
-    [selectAllButton setTag:1]; // 用于标识选择所有复选框
-    [contentView addSubview:selectAllButton];
-    
-    NSButton *deselectAllButton = [[NSButton alloc] initWithFrame:NSMakeRect(130, 45, 100, 30)];
-    [deselectAllButton setTitle:[[LanguageManager sharedManager] localizedStringForKeys:@"DeselectAll"
-                                                                              inModule:@"Backup"
-                                                                          defaultValue:@"全不选"]];
-    [deselectAllButton setTarget:self];
-    [deselectAllButton setAction:@selector(deselectAllDataTypes:)];
-    [deselectAllButton setTag:0]; // 用于标识取消选择所有复选框
-    [contentView addSubview:deselectAllButton];
-    
-    // 添加操作按钮
-    NSButton *cancelButton = [[NSButton alloc] initWithFrame:NSMakeRect(280, 10, 100, 30)];
-    [cancelButton setTitle:[[LanguageManager sharedManager] localizedStringForKeys:@"Cancel"
-                                                                          inModule:@"Common"
-                                                                      defaultValue:@"取消"]];
-    [cancelButton setTarget:self];
-    [cancelButton setAction:@selector(cancelDataTypeSelection:)];
-    [contentView addSubview:cancelButton];
-    
-    NSButton *startBackupButton = [[NSButton alloc] initWithFrame:NSMakeRect(390, 10, 100, 30)];
-    [startBackupButton setTitle:[[LanguageManager sharedManager] localizedStringForKeys:@"StartBackup"
-                                                                              inModule:@"Backup"
-                                                                          defaultValue:@"开始备份"]];
-    [startBackupButton setTarget:self];
-    [startBackupButton setAction:@selector(startSelectiveBackup:)];
-    [startBackupButton setKeyEquivalent:@"\r"]; // 设置为默认按钮
-    [contentView addSubview:startBackupButton];
-    
-    // 保存引用以便后续使用
-    self.dataTypeSelectionWindow = selectionWindow;
-    self.dataTypeCheckboxes = checkboxes;
-    self.supportedDataTypes = supportedTypes;
-    
-    // 显示窗口
-    [selectionWindow makeKeyAndOrderFront:nil];
-    [selectionWindow orderFrontRegardless];
-    
-    // ✅ 显示窗口前确保内存管理正确
-    [self.dataTypeSelectionWindow makeKeyAndOrderFront:nil];
-    
-    NSLog(@"DeviceBackupRestore: 数据类型选择对话框已显示，共 %lu 个可选项", (unsigned long)checkboxes.count);
+    return yPosition;
 }
 
-// ✅ 2. 添加窗口代理方法处理窗口关闭
+- (NSButton *)createCheckboxWithFrame:(NSRect)frame dataType:(BackupDataType)dataType {
+    NSButton *checkbox = [[NSButton alloc] initWithFrame:frame];
+    [checkbox setButtonType:NSButtonTypeSwitch];
+    [checkbox setState:NSControlStateValueOff];
+    [checkbox setTitle:[self getLocalizedDataTypeName:dataType]];
+    [checkbox setFont:[NSFont systemFontOfSize:14]];
+    [checkbox setTag:dataType];
+    [checkbox setTarget:self];
+    [checkbox setAction:@selector(dataTypeCheckboxChanged:)];
+    return checkbox;
+}
+
+- (void)createControlButtonsInView:(NSView *)contentView {
+    // 创建全选/全不选按钮
+    [self createButton:@"SelectAll" frame:NSMakeRect(20, 45, 100, 30)
+               action:@selector(selectAllDataTypes:) tag:1 inView:contentView];
+    
+    [self createButton:@"DeselectAll" frame:NSMakeRect(130, 45, 100, 30)
+               action:@selector(deselectAllDataTypes:) tag:0 inView:contentView];
+    
+    // 创建操作按钮
+    [self createButton:@"Cancel" frame:NSMakeRect(280, 10, 100, 30)
+               action:@selector(cancelDataTypeSelection:) tag:-1 inView:contentView];
+    
+    NSButton *startButton = [self createButton:@"StartBackup" frame:NSMakeRect(390, 10, 100, 30)
+                                      action:@selector(startSelectiveBackup:) tag:-1 inView:contentView];
+    [startButton setKeyEquivalent:@"\r"];
+}
+
+- (NSButton *)createButton:(NSString *)titleKey frame:(NSRect)frame action:(SEL)action tag:(NSInteger)tag inView:(NSView *)view {
+    NSButton *button = [[NSButton alloc] initWithFrame:frame];
+    [button setTitle:[[LanguageManager sharedManager] localizedStringForKeys:titleKey
+                                                                  inModule:@"Backup"
+                                                              defaultValue:titleKey]];
+    [button setTarget:self];
+    [button setAction:action];
+    [button setTag:tag];
+    [view addSubview:button];
+    return button;
+}
+
+#pragma mark - Window Delegate Methods
+
 - (void)windowWillClose:(NSNotification *)notification {
     if (notification.object == self.dataTypeSelectionWindow) {
-        NSLog(@"DeviceBackupRestore: 数据类型选择窗口即将关闭");
+        // 清理复选框
+        for (NSButton *checkbox in self.dataTypeCheckboxes) {
+            [checkbox setTarget:nil];
+            [checkbox setAction:NULL];
+        }
         
-        // 清理引用，避免内存泄漏
-        self.dataTypeCheckboxes = nil;
+        // 清理窗口引用
+        self.dataTypeSelectionWindow.delegate = nil;
         self.dataTypeSelectionWindow = nil;
+        self.dataTypeCheckboxes = nil;
     }
 }
+
+
 
 
 
