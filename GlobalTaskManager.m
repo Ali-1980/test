@@ -40,7 +40,6 @@ NSString * const GlobalDeviceStatusChangedNotification = @"GlobalDeviceStatusCha
         _priority = TaskPriorityNormal;
         _progress = 0.0;
         _isExclusive = NO;
-        _allowsViewSwitch = YES;
         _allowsConcurrency = YES;
         _canBeCancelled = YES;
         _requiresDeviceLock = NO;
@@ -141,7 +140,6 @@ NSString * const GlobalDeviceStatusChangedNotification = @"GlobalDeviceStatusCha
     copy.updateTime = [self.updateTime copy];
     copy.completionTime = [self.completionTime copy];
     copy.isExclusive = self.isExclusive;
-    copy.allowsViewSwitch = self.allowsViewSwitch;
     copy.allowsConcurrency = self.allowsConcurrency;
     copy.canBeCancelled = self.canBeCancelled;
     copy.requiresDeviceLock = self.requiresDeviceLock;
@@ -169,7 +167,6 @@ NSString * const GlobalDeviceStatusChangedNotification = @"GlobalDeviceStatusCha
     [coder encodeObject:self.updateTime forKey:@"updateTime"];
     [coder encodeObject:self.completionTime forKey:@"completionTime"];
     [coder encodeBool:self.isExclusive forKey:@"isExclusive"];
-    [coder encodeBool:self.allowsViewSwitch forKey:@"allowsViewSwitch"];
     [coder encodeBool:self.allowsConcurrency forKey:@"allowsConcurrency"];
     [coder encodeBool:self.canBeCancelled forKey:@"canBeCancelled"];
     [coder encodeBool:self.requiresDeviceLock forKey:@"requiresDeviceLock"];
@@ -195,7 +192,6 @@ NSString * const GlobalDeviceStatusChangedNotification = @"GlobalDeviceStatusCha
         _updateTime = [coder decodeObjectOfClass:[NSDate class] forKey:@"updateTime"];
         _completionTime = [coder decodeObjectOfClass:[NSDate class] forKey:@"completionTime"];
         _isExclusive = [coder decodeBoolForKey:@"isExclusive"];
-        _allowsViewSwitch = [coder decodeBoolForKey:@"allowsViewSwitch"];
         _allowsConcurrency = [coder decodeBoolForKey:@"allowsConcurrency"];
         _canBeCancelled = [coder decodeBoolForKey:@"canBeCancelled"];
         _requiresDeviceLock = [coder decodeBoolForKey:@"requiresDeviceLock"];
@@ -1392,6 +1388,107 @@ NSString * const GlobalDeviceStatusChangedNotification = @"GlobalDeviceStatusCha
     // 默认策略：固件相关操作需要锁定
     return [operationIdentifier containsString:@"firmware"] || [operationIdentifier containsString:@"restore"];
 }
+
+/**
+ * 视图切换时的状态检查
+ * @param targetView 目标视图标识
+ * @param currentView 当前视图标识
+ * @return 返回当前视图的任务状态信息
+ */
+- (NSDictionary *)checkViewTransitionState:(NSString *)targetView
+                              currentView:(NSString *)currentView {
+    NSMutableDictionary *state = [NSMutableDictionary dictionary];
+    
+    // 获取当前视图的活跃任务
+    NSArray<TaskInfo *> *activeTasks = [self getActiveTasksForSource:currentView];
+    
+    if (activeTasks.count > 0) {
+        // 有活跃任务，但允许切换
+        state[@"hasActiveTasks"] = @YES;
+        state[@"activeTaskCount"] = @(activeTasks.count);
+        state[@"canSwitch"] = @YES;  // 始终允许切换
+        
+        // 提供任务信息供UI展示
+        NSMutableArray *taskInfo = [NSMutableArray array];
+        for (TaskInfo *task in activeTasks) {
+            [taskInfo addObject:@{
+                @"taskId": task.taskId,
+                @"description": task.taskDescription,
+                @"progress": @(task.progress)
+            }];
+        }
+        state[@"tasks"] = taskInfo;
+    } else {
+        // 没有活跃任务
+        state[@"hasActiveTasks"] = @NO;
+        state[@"canSwitch"] = @YES;
+    }
+    
+    return state;
+}
+
+/**
+ * 处理视图返回逻辑
+ * @param viewIdentifier 视图标识
+ * @return 视图状态信息
+ */
+- (NSDictionary *)handleViewReturn:(NSString *)viewIdentifier {
+    NSArray<TaskInfo *> *tasks = [self getActiveTasksForSource:viewIdentifier];
+    
+    if (tasks.count > 0) {
+        // 有未完成的任务，返回该视图并继续任务
+        return @{
+            @"action": @"continueTask",
+            @"hasActiveTasks": @YES,
+            @"tasks": tasks
+        };
+    } else {
+        // 没有任务，可以返回默认视图
+        return @{
+            @"action": @"returnToDefault",
+            @"hasActiveTasks": @NO
+        };
+    }
+}
+
+/**
+ 切换到其他视图时
+ // 在 FlasherController.m
+ - (void)switchToOtherView {
+     NSDictionary *state = [[GlobalTaskManager sharedManager]
+                           checkViewTransitionState:@"targetView"
+                           currentView:@"FlasherController"];
+     
+     // 允许切换，但如果有活跃任务，可以显示提示
+     if ([state[@"hasActiveTasks"] boolValue]) {
+         // 可以选择显示一个提示，告知用户有任务正在进行
+         NSString *message = [NSString stringWithFormat:@"有%@个任务正在进行，切换后任务会继续在后台执行",
+                             state[@"activeTaskCount"]];
+         [self showNotification:message];
+     }
+     
+     // 执行视图切换
+     [self performViewTransition];
+ }
+ 
+ 返回到原视图时：
+ 
+ - (void)returnToView {
+     NSDictionary *state = [[GlobalTaskManager sharedManager]
+                           handleViewReturn:@"FlasherController"];
+     
+     if ([state[@"hasActiveTasks"] boolValue]) {
+         // 有未完成的任务，返回并继续显示任务状态
+         [self updateTaskUI:state[@"tasks"]];
+     } else {
+         // 没有任务，显示默认状态
+         [self resetToDefaultState];
+     }
+ }
+ 
+ 
+ 
+ */
 
 #pragma mark - 应用生命周期
 
