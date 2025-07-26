@@ -45,7 +45,7 @@ typedef NS_ENUM(NSInteger, TaskCreationResult) {
 
 // 核心标识信息
 @property (nonatomic, copy) NSString *taskId;                      // 任务唯一ID
-@property (nonatomic, copy) NSString *operationIdentifier;         // 操作标识符（对应 TaskBridge 的 operationName）
+@property (nonatomic, copy) NSString *operationIdentifier;         // 操作标识符（对应operationName）
 @property (nonatomic, copy) NSString *deviceID;                    // 设备ID
 @property (nonatomic, copy) NSString *sourceName;                  // 来源控制器名称
 
@@ -60,7 +60,6 @@ typedef NS_ENUM(NSInteger, TaskCreationResult) {
 
 // 任务行为属性（由 TaskBridge 配置决定）
 @property (nonatomic, assign) BOOL isExclusive;                    // 是否排他性
-@property (nonatomic, assign) BOOL allowsViewSwitch;               // 是否允许视图切换
 @property (nonatomic, assign) BOOL allowsConcurrency;              // 是否允许并发
 @property (nonatomic, assign) BOOL canBeCancelled;                 // 是否可取消
 @property (nonatomic, assign) BOOL requiresDeviceLock;             // 是否需要设备锁定
