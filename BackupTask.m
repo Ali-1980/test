@@ -535,7 +535,7 @@ static void notification_cb(const char *notification, void *user_data) {
     } else if (strcmp(notification, "com.apple.LocalAuthentication.ui.presented") == 0) {
         NSLog(@"[BackupTask] Device requires passcode");
         if (self.logCallback) {
-            //请在当前备份的设备上输入屏幕锁密码...
+            //请在所需备份的设备上输入屏幕锁密码, 等待设备响应...
             NSString *enterPasswordWaitingRespondTitle = [[LanguageManager sharedManager] localizedStringForKeys:@"EnterPasswordWaitingRespond" inModule:@"BackupManager" defaultValue:@"[WAR]Please enter the screen lock password on the current backup device..."];
             self.logCallback(enterPasswordWaitingRespondTitle);
         }
@@ -1627,26 +1627,6 @@ static void notification_cb(const char *notification, void *user_data) {
 
 - (BOOL)connectToDevice:(NSError **)error {
     NSLog(@"[BackupTask] Connecting to device");
-    
-    // 🔥 在获取设备UDID后，立即设置源UDID
-    if (!_deviceUDID) {
-        char *udid = NULL;
-        if (idevice_get_udid(_device, &udid) == IDEVICE_E_SUCCESS && udid) {
-            _deviceUDID = [NSString stringWithUTF8String:udid];
-            free(udid);
-            NSLog(@"📱 [BackupTask] 从设备获取UDID: %@", _deviceUDID);
-        }
-    }
-    
-    // 🔥 重要：确保源UDID设置
-    if (_deviceUDID && _deviceUDID.length > 0) {
-        // 如果源UDID未设置或与设备UDID不同，重新设置
-        if (!_sourceUDID || ![_sourceUDID isEqualToString:_deviceUDID]) {
-            _sourceUDID = [_deviceUDID copy];
-            NSLog(@"🔧 [BackupTask] 连接后设置源UDID: %@", _sourceUDID);
-        }
-    }
-    
     [self setInternalStatus:BackupTaskStatusConnecting];
     
     // 1. 创建设备连接
@@ -2058,38 +2038,6 @@ static void notification_cb(const char *notification, void *user_data) {
     NSLog(@"[BackupTask] ===== 开始备份操作 =====");
     NSLog(@"[BackupTask] Starting backup operation");
     
-    // 🔥 新增：确保源UDID正确设置
-    if (!_sourceUDID || _sourceUDID.length == 0) {
-        if (_deviceUDID && _deviceUDID.length > 0) {
-            _sourceUDID = [_deviceUDID copy];
-            NSLog(@"🔧 [BackupTask] 自动修复：设置源UDID为设备UDID: %@", _sourceUDID);
-        } else {
-            NSLog(@"❌ [BackupTask] 错误：设备UDID和源UDID都未设置");
-            if (error) {
-                *error = [self errorWithCode:BackupTaskErrorCodeInvalidArg
-                                 description:@"设备UDID未设置"];
-            }
-            return NO;
-        }
-    }
-    
-    // 🔥 新增：验证UDID一致性（对于完整备份）
-    if (![_sourceUDID isEqualToString:_deviceUDID]) {
-        NSLog(@"⚠️ [BackupTask] 警告：源UDID与设备UDID不一致");
-        NSLog(@"   源UDID: %@", _sourceUDID);
-        NSLog(@"   设备UDID: %@", _deviceUDID);
-        
-        // 对于完整备份，强制设置源UDID等于设备UDID
-        _sourceUDID = [_deviceUDID copy];
-        NSLog(@"🔧 [BackupTask] 强制修复：设置源UDID为设备UDID: %@", _sourceUDID);
-    }
-    
-    // 🔥 新增：记录最终使用的UDID
-    NSLog(@"✅ [BackupTask] 确认使用的UDID:");
-    NSLog(@"   设备UDID: %@", _deviceUDID);
-    NSLog(@"   源UDID: %@", _sourceUDID);
-    NSLog(@"   自定义路径: %@", self.isUsingCustomPath ? @"是" : @"否");
-    
     // ✅ 添加取消检查
     if (![self checkCancellationWithError:error]) {
         return NO;
@@ -2205,9 +2153,9 @@ static void notification_cb(const char *notification, void *user_data) {
     } else {
         // 标准模式：使用原有逻辑
         if ([_sourceUDID isEqualToString:_deviceUDID]) {
-            devBackupDir = [_backupDirectory stringByAppendingPathComponent:[self safeSourceUDID]];
+            devBackupDir = [_backupDirectory stringByAppendingPathComponent:_deviceUDID];
         } else {
-            devBackupDir = [_backupDirectory stringByAppendingPathComponent:[self safeSourceUDID]];
+            devBackupDir = [_backupDirectory stringByAppendingPathComponent:_sourceUDID];
         }
         NSLog(@"[BackupTask] Standard mode - using device/source UDID directory: %@", devBackupDir);
     }
@@ -7324,9 +7272,6 @@ static void notification_cb(const char *notification, void *user_data) {
     NSLog(@"[BackupTask] ✅ 传输完成统计: 总传输: %.2f MB, 总耗时: %.2f 秒, 平均速度: %.2f MB/s", _totalTransferredBytes / (1024.0 * 1024.0), totalDuration, avgSpeed);
 }
 
-- (NSString *)safeSourceUDID {
-    return _sourceUDID ?: _deviceUDID ?: @"";
-}
 
 // 处理接收的文件
 - (int)handleReceiveFiles:(plist_t)message {
@@ -7564,11 +7509,7 @@ static void notification_cb(const char *notification, void *user_data) {
                 NSString *correctRelativePath = pathInfo[@"relativePath"];
                 
                 // 从domain中提取UUID，然后获取Bundle ID
-                //[self extractUUIDFromPath:receivedDirName];
-                NSString *uuid = [self safeSourceUDID];
-                
-                NSLog(@"✅ handleReceiveFiles 继承原始UDID: %@", uuid);
-                
+                NSString *uuid = [self extractUUIDFromPath:receivedDirName];
                 NSString *bundleID = nil;
                 if (uuid) {
                     bundleID = [self getBundleIDFromInfoPlistForUUID:uuid];  // 使用现有缓存
@@ -7581,6 +7522,9 @@ static void notification_cb(const char *notification, void *user_data) {
                 _currentFileDomain = correctDomain;
                 _currentFileRelativePath = correctRelativePath;
                 _currentFileBundleID = bundleID;  // 新增实例变量
+                if (!bundleID) {
+                    NSLog(@"⚠️ [BundleID警告] bundleID 为 nil，UUID: %@, Domain: %@, RelativePath: %@", uuid, correctDomain, correctRelativePath);
+                }
                 
             } else {
                 // 如果没有dname，使用默认值
@@ -7596,10 +7540,9 @@ static void notification_cb(const char *notification, void *user_data) {
             
             if (self.isUsingCustomPath) {
                 // 自定义路径模式：检查并移除设备UDID前缀
-                if ([originalPath hasPrefix:[self safeSourceUDID]]) {
+                if ([originalPath hasPrefix:_deviceUDID]) {
                     // 移除设备UDID前缀
-                    NSString *sourceUDID = [self safeSourceUDID];
-                    NSString *relativePath = [originalPath substringFromIndex:sourceUDID.length];
+                    NSString *relativePath = [originalPath substringFromIndex:_deviceUDID.length];
                     if ([relativePath hasPrefix:@"/"]) {
                         relativePath = [relativePath substringFromIndex:1];
                     }
@@ -7615,10 +7558,9 @@ static void notification_cb(const char *notification, void *user_data) {
                 NSString *workingBackupDir = snapshotBackupDir;
                 
                 // 检查路径是否已经包含UDID
-                if ([originalPath hasPrefix:[self safeSourceUDID]]) {
+                if ([originalPath hasPrefix:_sourceUDID]) {
                     // 如果包含UDID，提取相对路径部分
-                    NSString *sourceUDID = [self safeSourceUDID];
-                    NSString *relativePath = [originalPath substringFromIndex:sourceUDID.length];
+                    NSString *relativePath = [originalPath substringFromIndex:_sourceUDID.length];
                     // 去除开头的斜杠(如果有)
                     if ([relativePath hasPrefix:@"/"]) {
                         relativePath = [relativePath substringFromIndex:1];
@@ -7883,12 +7825,7 @@ static void notification_cb(const char *notification, void *user_data) {
     });
     
     // 🔥 提取UUID（仅对可能包含UUID的路径）
-   // NSString *uuid = [self extractUUIDFromPath:devicePath];
-    
-    NSString *uuid = [self safeSourceUDID];
-    
-    NSLog(@"✅ parseDevicePathToDomainAndRelativePath 继承原始UDID: %@", uuid);
-    
+    NSString *uuid = [self extractUUIDFromPath:devicePath];
     //NSLog(@"🔍 [路径解析] 提取的UUID: %@", uuid ?: @"未找到");
     
     if (uuid) {
@@ -8290,7 +8227,7 @@ static void notification_cb(const char *notification, void *user_data) {
                 [NSString stringWithFormat:@"AppDomain-Container-%@", [uuid substringToIndex:MIN(8, uuid.length)]];
             
             // 相对路径：移除容器前缀，保留应用内部路径
-            NSRange range = NSMakeRange(4, components.count - 4);
+            NSRange range = NSMakeRange(2, components.count - 2);
             NSArray *relativeParts = [components subarrayWithRange:range];
             NSString *relativePath = [relativeParts componentsJoinedByString:@"/"];
             
@@ -8720,12 +8657,7 @@ static void notification_cb(const char *notification, void *user_data) {
                     
                     // 🔥 关键修改：从完整路径中提取UUID进行比较
                     if (containerPath) {
-                      //  NSString *extractedUUID = [self extractUUIDFromPath:containerPath];
-                        
-                        NSString *extractedUUID = [self safeSourceUDID];
-                        
-                        NSLog(@"✅ getGroupBundleIDFromInfoPlistForUUID 继承原始UDID: %@", extractedUUID);
-                        
+                        NSString *extractedUUID = [self extractUUIDFromPath:containerPath];
                         if (extractedUUID && [extractedUUID isEqualToString:groupUUID]) {
                             foundGroupBundleID = groupID;
                             NSLog(@"✅ [Group解析] 找到匹配: 路径=%@ → 提取UUID=%@ → GroupID=%@",
@@ -10507,7 +10439,6 @@ cleanup_and_exit:
                        duration:(double)duration
                  backupDirName:(NSString *)backupDirName
                      backupType:(NSString *)backupType {
-    
     // ✅ 新增：记录传入的加密状态用于调试
     NSLog(@"[BackupTask] 📝 开始更新Info.plist元数据 - isEncrypted: %@", isEncrypted ? @"YES" : @"NO");
     
@@ -10545,7 +10476,6 @@ cleanup_and_exit:
     
     // ✅ 新增：确认加密状态设置
     NSLog(@"[BackupTask] 🔐 Info.plist 加密状态已设置为: %@", isEncrypted ? @"Yes" : @"No");
-    
     // ✅ 关键：在同一函数内同时更新两个文件，确保100%一致性
     BOOL infoPlistSuccess = NO;
     BOOL backupInfoSuccess = NO;
@@ -10567,7 +10497,6 @@ cleanup_and_exit:
     if (infoPlistSuccess) {
         [self updateBackupBaselineEncryptionStatus:actualBackupDir isEncrypted:isEncrypted];
     }
-    
     // 清理资源
     plist_free(info_dict);
     
@@ -12200,7 +12129,6 @@ cleanup_and_exit:
 
 - (void)createEmptyStatusPlist000:(NSString *)path {
     NSLog(@"[BackupTask] Creating empty Status.plist at: %@", path);
-    
     // 创建基本的Status.plist结构
     plist_t status_dict = plist_new_dict();
     plist_dict_set_item(status_dict, "SnapshotState", plist_new_string("new"));
@@ -12247,7 +12175,6 @@ cleanup_and_exit:
     
     plist_free(status_dict);
 }
-
 
 - (void)updateStatusPlistState:(NSString *)path state:(NSString *)state {
     NSLog(@"[BackupTask] Updating Status.plist state to: %@", state);
@@ -12894,3 +12821,4 @@ cleanup_and_exit:
 }
 
 @end
+
